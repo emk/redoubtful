@@ -1,9 +1,10 @@
 //! Entry point for the `redoubtful` sandbox tool.
 
+mod cmd;
 mod deps;
 mod prelude;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::prelude::*;
@@ -12,7 +13,15 @@ use crate::prelude::*;
 #[derive(Debug, Parser)]
 #[command(name = "redoubtful", version, about)]
 struct Cli {
-    // Subcommands will be added in a later change.
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// Top-level `redoubtful` subcommands.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run a command inside the sandbox.
+    Run(cmd::run::Args),
 }
 
 #[tokio::main]
@@ -31,7 +40,10 @@ async fn main() -> Result<()> {
         pasta = %versions.pasta,
         "external dependencies found",
     );
-    Ok(())
+
+    match cli.command {
+        Command::Run(args) => cmd::run::cmd_run(args).await,
+    }
 }
 
 /// Initialize the `tracing` subscriber. Reads `RUST_LOG` if set; otherwise

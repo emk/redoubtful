@@ -27,3 +27,12 @@ fn help_flag_prints_usage() {
         .success()
         .stdout(contains("Usage:").and(contains("redoubtful")));
 }
+
+#[test]
+fn run_executes_the_given_command() {
+    cmd()
+        .args(["run", "echo", "hello from redoubtful"])
+        .assert()
+        .success()
+        .stdout(contains("hello from redoubtful"));
+}
