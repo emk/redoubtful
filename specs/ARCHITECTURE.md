@@ -1,5 +1,7 @@
 # redoubtful — v1 Architecture
 
+> **Status:** Original design. The core feature set is fairly settled; CLI details and code layout may still change quite a bit.
+
 A single-binary Linux tool that runs coding agents (Claude Code, OpenCode, etc.) inside a tight sandbox with just enough host access to be useful.
 
 The name is a small pun. `redoubt` is a small fortified enclosure; `redoubtful` reads simultaneously as "full of redoubts," as the archaic word meaning "apprehensive, dreading," and as "re-doubtful" — doubting again, the appropriate stance toward an agent whose outputs you already half-trust enough to run. The tool is all three things.

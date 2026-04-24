@@ -1,8 +1,5 @@
 //! Integration tests for the `redoubtful` CLI.
 
-// `unwrap` / `expect` are allowed in tests (see AGENTS.md).
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;

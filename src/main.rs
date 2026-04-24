@@ -1,5 +1,6 @@
 //! Entry point for the `redoubtful` sandbox tool.
 
+mod deps;
 mod prelude;
 
 use clap::Parser;
@@ -16,9 +17,20 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Set up logging first.
     init_tracing();
-    let _cli = Cli::parse();
-    debug!("redoubtful started");
+
+    // Parse our command-line arguments.
+    let cli = Cli::parse();
+    debug!(?cli, "arguments");
+
+    // Check that our external dependencies are present and log their versions.
+    let versions = deps::probe_required().await?;
+    debug!(
+        bwrap = %versions.bwrap,
+        pasta = %versions.pasta,
+        "external dependencies found",
+    );
     Ok(())
 }
 
