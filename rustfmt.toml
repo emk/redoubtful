@@ -1,0 +1,8 @@
+# These require `cargo +nightly fmt`, which isn't always available.
+# Our `just check` and `lefthook` pre-commit hooks run without `+nightly`,
+# generating warnings, but that's a deliberate compromise.
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+
+max_width = 80
+use_field_init_shorthand = true

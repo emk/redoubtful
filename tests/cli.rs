@@ -1,13 +1,18 @@
 //! Integration tests for the `redoubtful` CLI.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use assert_cmd::Command;
-use predicates::prelude::PredicateBooleanExt;
-use predicates::str::contains;
+use predicates::{prelude::PredicateBooleanExt, str::contains};
+
+/// Our CLI command.
+fn cmd() -> Command {
+    Command::cargo_bin("redoubtful").expect("binary exists")
+}
 
 #[test]
 fn version_flag_prints_package_version() {
-    Command::cargo_bin("redoubtful")
-        .expect("binary exists")
+    cmd()
         .arg("--version")
         .assert()
         .success()
@@ -16,8 +21,7 @@ fn version_flag_prints_package_version() {
 
 #[test]
 fn help_flag_prints_usage() {
-    Command::cargo_bin("redoubtful")
-        .expect("binary exists")
+    cmd()
         .arg("--help")
         .assert()
         .success()

@@ -40,9 +40,9 @@ async fn probe(binary: &str, package: &str) -> Result<String> {
             ));
         }
         Err(e) => {
-            return Err(e)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to run `{binary} --version`"));
+            return Err(e).into_diagnostic().wrap_err_with(|| {
+                format!("failed to run `{binary} --version`")
+            });
         }
     };
 
@@ -71,9 +71,10 @@ mod tests {
 
     #[tokio::test]
     async fn missing_binary_names_the_package() {
-        let err = probe("redoubtful-definitely-not-a-real-binary-xyz", "phantom-pkg")
-            .await
-            .unwrap_err();
+        let err =
+            probe("redoubtful-definitely-not-a-real-binary-xyz", "phantom-pkg")
+                .await
+                .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("redoubtful-definitely-not-a-real-binary-xyz"),
