@@ -4,3 +4,37 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[lints.rust]
+# Document all public items.
+missing_docs = "warn"
+
+# Forbid all unsafe code. This can be relaxed on a per-crate basis, but that
+# should only be done for C FFIs and Tokio primitives.
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Enable Clippy's standard warnings, at a low priority so they can be overridden
+# below.
+all = { priority = -1, level = "warn" }
+
+# These are assertions, not error-handling. They should only be used in tests,
+# or to indicate things which "can't happen" or which are clearly bugs.
+unwrap_used = "warn"
+expect_used = "warn"
+
+# Don't allow math to `panic` on overflow. Handle it using `checked_*` or
+# similar.
+arithmetic-side-effects = "deny"
+
+# Avoid `as` casts when they can be replaced with anything else, especially for
+# numeric conversions. Always prefer `From` or `TryFrom` methods, and propagate
+# errors up the call chain whenever there's any reasonable way to do that.
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+
+# No `transmute` calls at all, but these we can forbid automatically.
+transmute_ptr_to_ref = "deny"
+transmutes_expressible_as_ptr_casts = "deny"
+wrong_transmute = "deny"
