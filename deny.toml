@@ -1,0 +1,29 @@
+# Project policies.
+#
+# These policies can be enforced using `cargo deny check`.
+
+[advisories]
+ignore = []
+
+[licenses]
+# Allow common OSI-approved, non-copyleft licenses.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+
+[bans]
+deny = [
+    # OpenSSL has caused endless deployment and build problems. We use rustls
+    # for TLS everywhere.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+]
+skip = [
+    # `miette` pulls in both 0.1.x (directly) and 0.2.x (via `textwrap`).
+    # Nothing we can do about it at our level.
+    { name = "unicode-width" },
+]
