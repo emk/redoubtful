@@ -35,27 +35,13 @@ async fn probe(binary: &str, package: &str) -> Result<String> {
     let output = match Command::new(binary).arg("--version").output().await {
         Ok(output) => output,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(miette!(
-                "`{binary}` not found. Install the `{package}` package using your system package manager."
-            )
-            .into());
+            return Err(Error::missing_dependency(binary, package));
         }
-        Err(e) => {
-            return Err(e)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to run `{binary} --version`"))
-                .map_err(Into::into);
-        }
+        Err(e) => return Err(Error::could_not_run(binary, e)),
     };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette!(
-            "`{binary} --version` exited with {}: {}",
-            output.status,
-            stderr.trim()
-        )
-        .into());
+        return Err(Error::could_not_get_version(binary));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -63,7 +49,7 @@ async fn probe(binary: &str, package: &str) -> Result<String> {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .ok_or_else(|| miette!("`{binary} --version` produced no output"))?
+        .ok_or_else(|| Error::could_not_get_version(binary))?
         .to_string();
     Ok(version)
 }

@@ -1,36 +1,116 @@
 //! Top-level error type.
 //!
-//! `main` peels off [`Error::Exit`] to propagate a child process's exit code
-//! verbatim, and hands [`Error::Other`] back to `miette`'s `Termination`
-//! impl for pretty diagnostic rendering. Nothing below `main` needs to know
-//! about this distinction — subcommand handlers just return `Ok`, an
-//! `Error::Exit`, or (implicitly, via `?`) an `Error::Other`.
+//! All errors propagated up to `main` are concrete variants of [`Error`],
+//! which derives `miette::Diagnostic` for pretty rendering. `main` peels
+//! off [`Error::Exit`] to propagate a sandboxed child's exit code verbatim,
+//! and wraps any other variant in a `miette::Report` so its `Termination`
+//! impl renders the diagnostic. Subcommand handlers just construct the
+//! appropriate variant (or propagate one via `?`).
 
-use std::fmt;
+use std::io;
 
-/// Errors propagated up to `main`.
-pub enum Error {
-    /// Exit with this code (typically a sandboxed child's exit code).
-    Exit(i32),
-
-    /// Any other error; rendered via `miette`.
-    Other(miette::Report),
-}
-
-impl From<miette::Report> for Error {
-    fn from(report: miette::Report) -> Self {
-        Error::Other(report)
-    }
-}
-
-impl fmt::Debug for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Exit(code) => write!(f, "Exit({code})"),
-            Error::Other(report) => fmt::Debug::fmt(report, f),
-        }
-    }
-}
+use miette::Diagnostic;
 
 /// Result type used throughout the crate. Error defaults to [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Errors propagated up to `main`.
+#[derive(Debug, Diagnostic, thiserror::Error)]
+pub enum Error {
+    /// Wrapped process exited with this code
+    #[error("`{command}` exited with code {code}")]
+    Exit {
+        /// The command that exited.
+        command: String,
+
+        /// The exit code.
+        code: i32,
+    },
+
+    /// Wrapped process was terminated by a signal.
+    #[error("`{command}` was terminated by signal {signal}")]
+    Signal {
+        /// The command that was terminated.
+        command: String,
+
+        /// The signal number.
+        signal: i32,
+    },
+
+    /// Could not run a command.
+    #[error("could not run `{command}`")]
+    CouldNotRun {
+        /// The command we tried to run.
+        command: String,
+
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Missing dependency.
+    #[error(
+        "`{command}` not found. Install the `{package}` package using your system package manager"
+    )]
+    MissingDependency {
+        /// The missing binary.
+        command: String,
+
+        /// The package that provides the binary.
+        package: String,
+    },
+
+    /// Could not get a version string from a dependency.
+    #[error("`{command} --version` did not return a version string")]
+    CouldNotGetVersion {
+        /// The command we tried to get a version string from.
+        command: String,
+    },
+}
+
+impl Error {
+    /// Create an [`Error::Exit`].
+    pub fn exit(command: impl Into<String>, code: i32) -> Self {
+        Self::Exit {
+            command: command.into(),
+            code,
+        }
+    }
+
+    /// Create an [`Error::Signal`].
+    pub fn signal(command: impl Into<String>, signal: i32) -> Self {
+        Self::Signal {
+            command: command.into(),
+            signal,
+        }
+    }
+
+    /// Create an [`Error::CouldNotRun`].
+    pub fn could_not_run(
+        command: impl Into<String>,
+        source: io::Error,
+    ) -> Self {
+        Self::CouldNotRun {
+            command: command.into(),
+            source,
+        }
+    }
+
+    /// Create an [`Error::MissingDependency`].
+    pub fn missing_dependency(
+        command: impl Into<String>,
+        package: impl Into<String>,
+    ) -> Self {
+        Self::MissingDependency {
+            command: command.into(),
+            package: package.into(),
+        }
+    }
+
+    /// Create an [`Error::CouldNotGetVersion`].
+    pub fn could_not_get_version(command: impl Into<String>) -> Self {
+        Self::CouldNotGetVersion {
+            command: command.into(),
+        }
+    }
+}

@@ -33,10 +33,10 @@ async fn main() -> miette::Result<()> {
     match run().await {
         Ok(()) => Ok(()),
         // Propagate a child process's exit code verbatim.
-        Err(Error::Exit(code)) => std::process::exit(code),
-        // Hand any other error to `miette`'s `Termination` impl, which
-        // renders it via `Report`'s fancy `Debug` and exits non-zero.
-        Err(Error::Other(report)) => Err(report),
+        Err(Error::Exit { code, .. }) => std::process::exit(code),
+        // Hand other errors to miette's `Termination` impl for pretty
+        // diagnostic rendering.
+        Err(other) => Err(miette::Report::new(other)),
     }
 }
 

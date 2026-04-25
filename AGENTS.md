@@ -43,7 +43,7 @@ We believe in secure, correct code with good test coverage.
 
 ### Error Handling
 
-For error handling, we use `miette::Report`. `miette` is new, so you may need to occasionally check the docs.
+For error handling, we use a custom `Error` enum and `Result` type in `src/errors.rs`. All errors will need to be converted to this type, and there it not current a fallback for `Other`, so take a look at how it works and add enum variants as necessary.
 
 We only use `unwrap` and `except` as true assertions, for programmer errors and things that "can't happen." (And of course, they're fine in tests.) If you use them, prefer `expect` for documentation, and leave a 1-line comment explaining why the condition should never happen.
 

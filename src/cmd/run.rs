@@ -3,6 +3,8 @@
 //! The sandbox is not yet implemented; for now this simply runs the command
 //! on the host so we can build up the CLI surface incrementally.
 
+use std::os::unix::process::ExitStatusExt as _;
+
 use tokio::process::Command;
 
 use crate::prelude::*;
@@ -35,12 +37,17 @@ pub async fn cmd_run(args: Args) -> Result<()> {
         .args(&args)
         .status()
         .await
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to run `{command}`"))?;
+        .map_err(|e| Error::could_not_run(&command, e))?;
 
-    match status.code() {
-        Some(0) => Ok(()),
-        Some(code) => Err(Error::Exit(code)),
-        None => Err(miette!("`{command}` was terminated by a signal").into()),
+    match (status.code(), status.signal()) {
+        (Some(0), _) => Ok(()),
+        (Some(code), _) => Err(Error::exit(command, code)),
+        (None, Some(signal)) => Err(Error::signal(command, signal)),
+        (None, None) => {
+            warn!(
+                "process terminated without exit code or signal; treating as exit code 1"
+            );
+            Err(Error::exit(command, 1))
+        }
     }
 }
