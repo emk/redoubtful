@@ -3,6 +3,10 @@
 > **Status:** Research by Claude, with empirical verification on a
 > single Ubuntu 24.04 box (kernel 6.17, AppArmor 4.0.1). Check
 > sources before relying on any specific claim.
+>
+> **See also:** [HARDENING.md](HARDENING.md) for the broader
+> defense-in-depth model this AppArmor work fits into. The AppArmor
+> layer is one of seven; the others are portable across distros.
 
 Ubuntu 24.04 (Noble) and later ship with AppArmor's
 "unprivileged userns restriction" turned on by default. With this
@@ -74,6 +78,47 @@ prior that the next bug of this shape is coming.
 [cve-2022-24122]: https://nvd.nist.gov/vuln/detail/CVE-2022-24122
 [cve-2020-14386]: https://nvd.nist.gov/vuln/detail/CVE-2020-14386
 [cve-2024-1086]: https://nvd.nist.gov/vuln/detail/CVE-2024-1086
+
+## How nested user namespaces compound the risk
+
+The kernel-attack-surface story has a second layer that's easy to
+miss. From `user_namespaces(7)`:
+
+> The child process created by clone(2) with the CLONE_NEWUSER flag
+> starts out with a complete set of capabilities in the new user
+> namespace. Likewise, a process that creates a new user namespace
+> using unshare(2) ... gains a full set of capabilities in that
+> namespace.
+
+Translation: **whoever creates a user namespace becomes its owner
+and gets the full namespaced capability set inside it, regardless
+of UID or capabilities held before.** This is the deliberate
+mechanism by which unprivileged users gain `CAP_SYS_ADMIN` etc. for
+legitimate container-style use.
+
+The direct consequence for sandboxing is unpleasant: an agent
+process that starts inside our bwrap sandbox with no useful caps
+can still call `unshare -U -m` to spawn a *child* user namespace
+where it is the owner, and therefore has full namespaced caps. The
+kernel attack surface that motivates the original AppArmor
+restriction is reachable from inside our sandbox via one syscall —
+unless we close that path.
+
+The Tier 1 profile addresses this with the recursive `pix /** ->
+&redoubtful_unpriv` rule: any further userns the agent creates
+inherits `audit deny capability,` from `redoubtful_unpriv`, so the
+caps the kernel grants are stripped at the LSM layer before they
+can reach a privileged syscall. That recursion-handling is the
+*specific* reason the Tier 1 chain looks the way it does, and is
+the main thing Tier 2's `flags=(unconfined)` profile gives up: the
+agent inside Tier 2 *can* recurse into a fresh userns and reach the
+full kernel attack surface there.
+
+Independent of AppArmor, redoubtful should also block userns
+recursion at the seccomp and per-userns-sysctl layers as
+defense-in-depth — those mechanisms apply on non-Ubuntu hosts where
+AppArmor isn't available. See [HARDENING.md](HARDENING.md) for the
+broader layering.
 
 ## Why no default bwrap profile
 
