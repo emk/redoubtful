@@ -37,12 +37,14 @@ async fn probe(binary: &str, package: &str) -> Result<String> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(miette!(
                 "`{binary}` not found. Install the `{package}` package using your system package manager."
-            ));
+            )
+            .into());
         }
         Err(e) => {
-            return Err(e).into_diagnostic().wrap_err_with(|| {
-                format!("failed to run `{binary} --version`")
-            });
+            return Err(e)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to run `{binary} --version`"))
+                .map_err(Into::into);
         }
     };
 
@@ -52,7 +54,8 @@ async fn probe(binary: &str, package: &str) -> Result<String> {
             "`{binary} --version` exited with {}: {}",
             output.status,
             stderr.trim()
-        ));
+        )
+        .into());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);

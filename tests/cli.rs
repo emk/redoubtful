@@ -36,3 +36,17 @@ fn run_executes_the_given_command() {
         .success()
         .stdout(contains("hello from redoubtful"));
 }
+
+#[test]
+fn run_propagates_child_exit_code() {
+    cmd().args(["run", "sh", "-c", "exit 42"]).assert().code(42);
+}
+
+#[test]
+fn run_reports_missing_command() {
+    cmd()
+        .args(["run", "redoubtful-no-such-binary-xyz"])
+        .assert()
+        .failure()
+        .stderr(contains("redoubtful-no-such-binary-xyz"));
+}

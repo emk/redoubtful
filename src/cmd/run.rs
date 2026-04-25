@@ -40,11 +40,7 @@ pub async fn cmd_run(args: Args) -> Result<()> {
 
     match status.code() {
         Some(0) => Ok(()),
-        Some(code) => {
-            // Propagate the child's exit code. Bypasses the usual
-            // `Result`-based main return, which can only express 0 or 1.
-            std::process::exit(code);
-        }
-        None => Err(miette!("`{command}` was terminated by a signal")),
+        Some(code) => Err(Error::Exit(code)),
+        None => Err(miette!("`{command}` was terminated by a signal").into()),
     }
 }

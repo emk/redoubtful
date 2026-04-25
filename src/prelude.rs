@@ -7,5 +7,7 @@
 // consumers to use only a subset.
 #![allow(unused_imports)]
 
-pub use miette::{IntoDiagnostic, Report, Result, WrapErr, miette};
+pub use miette::{IntoDiagnostic, WrapErr, miette};
 pub use tracing::{debug, error, info, instrument, trace, warn};
+
+pub use crate::errors::{Error, Result};

@@ -2,6 +2,7 @@
 
 mod cmd;
 mod deps;
+mod errors;
 mod prelude;
 
 use clap::{Parser, Subcommand};
@@ -25,10 +26,23 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> miette::Result<()> {
     // Set up logging first.
     init_tracing();
 
+    match run().await {
+        Ok(()) => Ok(()),
+        // Propagate a child process's exit code verbatim.
+        Err(Error::Exit(code)) => std::process::exit(code),
+        // Hand any other error to `miette`'s `Termination` impl, which
+        // renders it via `Report`'s fancy `Debug` and exits non-zero.
+        Err(Error::Other(report)) => Err(report),
+    }
+}
+
+/// Real top-level logic, now that we have logging.
+#[instrument(level = "debug", name = "redoubtful", skip_all)]
+async fn run() -> Result<()> {
     // Parse our command-line arguments.
     let cli = Cli::parse();
     debug!(?cli, "arguments");
