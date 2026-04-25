@@ -66,6 +66,29 @@ pub enum Error {
         /// The command we tried to get a version string from.
         command: String,
     },
+
+    /// Could not determine the current working directory.
+    #[error("could not determine current directory")]
+    CouldNotGetCwd {
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// A required environment variable is not set.
+    #[error("environment variable `{name}` is not set")]
+    MissingEnvVar {
+        /// The variable name.
+        name: String,
+    },
+
+    /// Could not write to standard output.
+    #[error("could not write to stdout")]
+    CouldNotWriteStdout {
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl Error {
@@ -112,5 +135,20 @@ impl Error {
         Self::CouldNotGetVersion {
             command: command.into(),
         }
+    }
+
+    /// Create an [`Error::CouldNotGetCwd`].
+    pub fn could_not_get_cwd(source: io::Error) -> Self {
+        Self::CouldNotGetCwd { source }
+    }
+
+    /// Create an [`Error::MissingEnvVar`].
+    pub fn missing_env_var(name: impl Into<String>) -> Self {
+        Self::MissingEnvVar { name: name.into() }
+    }
+
+    /// Create an [`Error::CouldNotWriteStdout`].
+    pub fn could_not_write_stdout(source: io::Error) -> Self {
+        Self::CouldNotWriteStdout { source }
     }
 }

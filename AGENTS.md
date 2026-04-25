@@ -35,7 +35,7 @@ We aim for the third.
 
 We aim to reduce duplication, but not at the expense of adding significant complexity. Pulling out duplicated code into functions and giving them a good name is great. Resorting to writing proc macros in order to save a few characters is a false economy.
 
-Even in tests, we strive for clarity and minimal boilerplate. We use `mod tests { .. }`, we extract boilerplate into functions, and we prefer test cases with `let examples = &[...]` and a loop rather over many indentical functions.
+Even in tests, we strive for clarity and minimal boilerplate. We use `mod tests { .. }`, we extract boilerplate into functions, and we prefer test cases with `let examples = &[...]` and a loop over many near-indentical `#[test]` functions with the same boilerplate.
 
 We believe in secure, correct code with good test coverage.
 
@@ -43,9 +43,9 @@ We believe in secure, correct code with good test coverage.
 
 ### Error Handling
 
-For error handling, we use a custom `Error` enum and `Result` type in `src/errors.rs`. All errors will need to be converted to this type, and there it not current a fallback for `Other`, so take a look at how it works and add enum variants as necessary.
+For error handling, we use a custom `Error` enum and `Result` type in `src/errors.rs`. All errors will need to be converted to this type, and there is not currently a fallback like "`Other`", so take a look at how it works and add enum variants as necessary.
 
-We only use `unwrap` and `except` as true assertions, for programmer errors and things that "can't happen." (And of course, they're fine in tests.) If you use them, prefer `expect` for documentation, and leave a 1-line comment explaining why the condition should never happen.
+We only use `unwrap` and `except` as true assertions, for programmer errors and things that "can't happen." (And of course, they're fine in tests.) If you use them, prefer `expect` because it includes documentation, and leave a 1-line comment explaining why the condition should never happen.
 
 ### Prelude
 
@@ -59,7 +59,7 @@ All public items must be documented.
 
 Unsafe code is forbidden.
 
-### Arithmetic and Numeric Conversions
+### Arithmetic and Numeric Conversionsg 
 
 Don't use arithmetic that can panic on overflow. Use `checked_*`, `saturating_*`, or `wrapping_*` methods instead. Whenever feasible, propagate and report failures as errors.
 

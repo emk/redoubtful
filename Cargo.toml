@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 miette = { version = "7.6.0", features = ["fancy"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 thiserror = "2.0.18"
 tokio = { version = "1.52.1", features = ["macros", "process", "rt-multi-thread", "signal"] }
 tracing = "0.1.44"
@@ -15,6 +17,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 assert_cmd = "2.2.1"
 predicates = "3.1.4"
+tempfile = { version = "3.27.0", default-features = false }
 
 [lints.rust]
 # Document all public items.

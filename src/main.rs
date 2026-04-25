@@ -3,7 +3,9 @@
 mod cmd;
 mod deps;
 mod errors;
+mod mounts;
 mod prelude;
+mod sandbox;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -23,6 +25,9 @@ struct Cli {
 enum Command {
     /// Run a command inside the sandbox.
     Run(cmd::run::Args),
+
+    /// Print the sandbox's mount inventory.
+    Mounts(cmd::mounts::Args),
 }
 
 #[tokio::main]
@@ -47,16 +52,22 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     debug!(?cli, "arguments");
 
-    // Check that our external dependencies are present and log their versions.
-    let versions = deps::probe_required().await?;
-    debug!(
-        bwrap = %versions.bwrap,
-        pasta = %versions.pasta,
-        "external dependencies found",
-    );
-
     match cli.command {
-        Command::Run(args) => cmd::run::cmd_run(args).await,
+        Command::Run(args) => {
+            // `redoubtful run` actually launches the sandbox, so probe
+            // bwrap/pasta first and bail with a friendly error if they
+            // are missing.
+            let versions = deps::probe_required().await?;
+            debug!(
+                bwrap = %versions.bwrap,
+                pasta = %versions.pasta,
+                "external dependencies found",
+            );
+            cmd::run::cmd_run(args).await
+        }
+        // `redoubtful mounts` only inspects what we'd construct, so it
+        // doesn't need bwrap/pasta to be installed.
+        Command::Mounts(args) => cmd::mounts::cmd_mounts(args).await,
     }
 }
 

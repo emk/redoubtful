@@ -83,7 +83,7 @@ tool-binary
           └─ user command
 ```
 
-Critical: bwrap must **not** include `--unshare-net` or `--unshare-all`. It enumerates its unshares explicitly so pasta's netns is inherited. The relevant bwrap flags are `--unshare-ipc --unshare-pid --unshare-user --unshare-uts --unshare-cgroup`.
+Critical: bwrap must **not** include `--unshare-net`, and must inherit pasta's netns. The supported way to express "unshare everything except net" is `--unshare-all --share-net` — `--share-net` per the bwrap manpage "can only combine with --unshare-all". This idiom is preferred over enumerating individual `--unshare-*` flags: any new namespace future bwrap adds gets unshared automatically (fail-closed), and it matches the canonical `containers/bubblewrap/demos/bubblewrap-shell.sh` pattern.
 
 ## Filesystem layout inside the sandbox
 
@@ -328,7 +328,7 @@ pasta \
 
 Key flags:
 
-- `--unshare-ipc --unshare-pid --unshare-user --unshare-uts --unshare-cgroup` — not `--unshare-all`, not `--unshare-net`.
+- `--unshare-all --share-net` — unshare every namespace bwrap supports *except* net (which pasta owns and we inherit). See "Process nesting" above for the rationale.
 - `--die-with-parent`
 - `--new-session` (needed to protect against TIOCSTI out-of-sandbox command injection, per CVE-2017-5226)
 - `--clearenv` followed by explicit `--setenv` for every variable we want. Don't inherit the host environment.
