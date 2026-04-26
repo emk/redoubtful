@@ -1,11 +1,14 @@
 //! Entry point for the `redoubtful` sandbox tool.
 
+mod argv;
+mod bwrap;
 mod cmd;
 mod deps;
 mod errors;
+mod forward;
 mod mounts;
+mod pasta;
 mod prelude;
-mod sandbox;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -28,9 +31,34 @@ enum Command {
 
     /// Print the sandbox's mount inventory.
     Mounts(cmd::mounts::Args),
+
+    /// Print the sandbox's TCP forward inventory.
+    Forwards(cmd::forwards::Args),
 }
 
-#[tokio::main]
+// We use `current_thread`, not the multi-thread default, on purpose: the pasta
+// lifecycle binding in `cmd::run` uses `PR_SET_PDEATHSIG`, which the kernel
+// ties to the *thread* that called `fork()`, not the parent process. With a
+// multi-thread runtime, that thread is whichever worker happened to poll the
+// spawning task — fine in practice today (tokio workers only exit when the
+// runtime drops) but a footgun under any future refactor that introduces
+// another runtime, parks/joins workers, or moves the spawn off the main task.
+// `current_thread` makes the parent-of-pasta the main thread, which only exits
+// when redoubtful itself exits, so the prctl's "fire when parent dies"
+// semantics line up with our intent without depending on tokio's
+// worker-lifecycle implementation details. We don't lose anything: nothing in
+// this binary needs to parallelize across cores.
+//
+// If we relax this later (e.g. the credential proxy becomes CPU-bound enough to
+// want a worker pool), the property the PR_SET_PDEATHSIG site needs is: **the
+// OS thread that calls `pasta`'s `Command::spawn()` lives as long as the
+// executable does.** Today that's true for tokio worker threads (they're
+// destroyed only when the runtime is dropped, which only happens as main
+// returns), so the multi-thread default is *also* safe in practice — the reason
+// to prefer `current_thread` here is that "the main thread" is a guarantee in
+// the language and "tokio workers outlive the runtime" is an implementation
+// detail.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> miette::Result<()> {
     // Set up logging first.
     init_tracing();
@@ -68,6 +96,8 @@ async fn run() -> Result<()> {
         // `redoubtful mounts` only inspects what we'd construct, so it
         // doesn't need bwrap/pasta to be installed.
         Command::Mounts(args) => cmd::mounts::cmd_mounts(args).await,
+        // Same: `forwards` is a pure inspector.
+        Command::Forwards(args) => cmd::forwards::cmd_forwards(args).await,
     }
 }
 

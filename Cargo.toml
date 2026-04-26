@@ -5,7 +5,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+capctl = "0.2.4"
 clap = { version = "4.6.1", features = ["derive"] }
+libc = "0.2.186"
 miette = { version = "7.6.0", features = ["fancy"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -18,14 +20,21 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 assert_cmd = "2.2.1"
 predicates = "3.1.4"
 tempfile = { version = "3.27.0", default-features = false }
+# Cargo unifies tokio features with `[dependencies]`, so list only the
+# extras tests need on top of the runtime feature set.
+tokio = { version = "1.52.1", features = ["net", "io-util"] }
 
 [lints.rust]
 # Document all public items.
 missing_docs = "warn"
 
-# Forbid all unsafe code. This can be relaxed on a per-crate basis, but that
-# should only be done for C FFIs and Tokio primitives.
-unsafe_code = "forbid"
+# Deny all unsafe code by default. Per-function `#[allow(unsafe_code)]` is
+# permitted only for C FFIs and Tokio/std OS primitives (notably
+# `CommandExt::pre_exec` for `prctl(PR_SET_PDEATHSIG)` lifecycle binding;
+# see `src/cmd/run.rs`). `deny` rather than `forbid` exists precisely so
+# those carveouts can be expressed; bare `unsafe` blocks elsewhere remain
+# build-breakers.
+unsafe_code = "deny"
 
 [lints.clippy]
 # Enable Clippy's standard warnings, at a low priority so they can be overridden

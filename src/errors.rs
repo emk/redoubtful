@@ -8,6 +8,7 @@
 //! appropriate variant (or propagate one via `?`).
 
 use std::io;
+use std::path::PathBuf;
 
 use miette::Diagnostic;
 
@@ -89,6 +90,20 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+
+    /// A `-m`/`--mount-rw` host path could not be stat'ed.
+    /// Stat'd up-front in `MountOpts::validate` so the user gets
+    /// a clear diagnostic instead of bwrap's terser failure deep
+    /// inside sandbox setup.
+    #[error("mount host path `{path}` is not accessible")]
+    MissingMountHost {
+        /// The host path the user passed.
+        path: PathBuf,
+
+        /// The underlying I/O error from `stat`.
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl Error {
@@ -150,5 +165,10 @@ impl Error {
     /// Create an [`Error::CouldNotWriteStdout`].
     pub fn could_not_write_stdout(source: io::Error) -> Self {
         Self::CouldNotWriteStdout { source }
+    }
+
+    /// Create an [`Error::MissingMountHost`].
+    pub fn missing_mount_host(path: PathBuf, source: io::Error) -> Self {
+        Self::MissingMountHost { path, source }
     }
 }

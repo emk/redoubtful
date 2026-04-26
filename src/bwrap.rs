@@ -26,7 +26,8 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use crate::mounts::{Mount, MountKind};
+use crate::argv::ArgvBuilder;
+use crate::mounts::{MountKind, MountList};
 use crate::prelude::*;
 
 /// Build the full argv for `bwrap` (not including `bwrap` itself),
@@ -34,7 +35,7 @@ use crate::prelude::*;
 #[instrument(level = "debug", skip_all,
     fields(command, n_mounts = mounts.len()))]
 pub fn bwrap_argv(
-    mounts: &[Mount],
+    mounts: &MountList,
     cwd: &Path,
     command: &str,
     args: &[String],
@@ -49,10 +50,9 @@ pub fn bwrap_argv(
     // namespace bwrap supports *except* net" — the network
     // namespace is inherited from our parent.
     //
-    // Today, our parent is the user's shell, so we inherit the host
-    // netns (full Internet access — temporary, will be locked down
-    // when we add pasta). Tomorrow, our parent will be pasta, and we
-    // inherit pasta's restricted netns the same way.
+    // Today our parent is pasta (see `crate::pasta`), which created
+    // a private netns; bwrap inherits that, isolated from the host's
+    // network entirely apart from the explicit pasta forwards.
     //
     // Why follow the demo's idiom rather than enumerate
     // (--unshare-ipc --unshare-pid --unshare-user --unshare-uts
@@ -81,8 +81,9 @@ pub fn bwrap_argv(
     // ===== Lifecycle =====
     //
     // --die-with-parent: SIGKILL the sandboxed process if our
-    // launcher (this process) dies. Without this, `kill -9` of
-    // redoubtful would orphan the sandboxed agent.
+    // immediate parent (pasta) dies. Pasta in turn carries
+    // PR_SET_PDEATHSIG from `redoubtful run`, so the chain unwinds:
+    // redoubtful dies → pasta dies → bwrap dies → user command dies.
     //
     //   <https://man.archlinux.org/man/bwrap.1.en>
     a.flag("--die-with-parent");
@@ -104,12 +105,14 @@ pub fn bwrap_argv(
     //
     // Translated 1:1 from the inventory (see `crate::mounts`). All
     // semantic decisions live there with auditability comments.
-    for m in mounts {
+    for m in mounts.iter() {
         match &m.kind {
-            MountKind::RoBind { host } => {
+            MountKind::MountRo { host } => {
                 a.pair_path("--ro-bind", host, &m.sandbox)
             }
-            MountKind::Bind { host } => a.pair_path("--bind", host, &m.sandbox),
+            MountKind::MountRw { host } => {
+                a.pair_path("--bind", host, &m.sandbox)
+            }
             MountKind::Symlink { target } => {
                 a.pair_str_path("--symlink", target, &m.sandbox);
             }
@@ -124,47 +127,12 @@ pub fn bwrap_argv(
     a.flag("--");
     a.flag(command);
     a.extend_args(args);
-    a.into_vec()
-}
+    let argv = a.into_vec();
 
-/// Internal helper that accumulates `OsString` argv tokens. Keeps
-/// the call site readable (one logical step per line).
-#[derive(Default)]
-struct ArgvBuilder {
-    argv: Vec<OsString>,
-}
-
-impl ArgvBuilder {
-    fn flag(&mut self, s: &str) {
-        self.argv.push(OsString::from(s));
-    }
-
-    fn single_path(&mut self, flag: &str, p: &Path) {
-        self.argv.push(OsString::from(flag));
-        self.argv.push(p.as_os_str().to_owned());
-    }
-
-    fn pair_path(&mut self, flag: &str, a: &Path, b: &Path) {
-        self.argv.push(OsString::from(flag));
-        self.argv.push(a.as_os_str().to_owned());
-        self.argv.push(b.as_os_str().to_owned());
-    }
-
-    fn pair_str_path(&mut self, flag: &str, a: &str, b: &Path) {
-        self.argv.push(OsString::from(flag));
-        self.argv.push(OsString::from(a));
-        self.argv.push(b.as_os_str().to_owned());
-    }
-
-    fn extend_args(&mut self, args: &[String]) {
-        for a in args {
-            self.argv.push(OsString::from(a));
-        }
-    }
-
-    fn into_vec(self) -> Vec<OsString> {
-        self.argv
-    }
+    // Per spec: log the exact bwrap argv at DEBUG so users can
+    // reproduce failures by hand. (`specs/ARCHITECTURE.md` final notes.)
+    debug!(?argv, "bwrap argv");
+    argv
 }
 
 #[cfg(test)]
@@ -172,7 +140,6 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
-    use crate::mounts::default_mount_list;
 
     fn os(s: &str) -> OsString {
         OsString::from(s)
@@ -192,8 +159,10 @@ mod tests {
 
     #[test]
     fn argv_starts_with_unshare_all_share_net() {
-        let mounts =
-            default_mount_list(Path::new("/home/u"), Path::new("/home/u/proj"));
+        let mounts = MountList::default_baseline(
+            Path::new("/home/u"),
+            Path::new("/home/u/proj"),
+        );
         let argv = bwrap_argv(&mounts, Path::new("/home/u/proj"), "true", &[]);
         assert_eq!(argv.first(), Some(&os("--unshare-all")));
         assert_eq!(argv.get(1), Some(&os("--share-net")));
@@ -201,8 +170,10 @@ mod tests {
 
     #[test]
     fn argv_includes_die_with_parent_and_new_session() {
-        let mounts =
-            default_mount_list(Path::new("/home/u"), Path::new("/home/u/proj"));
+        let mounts = MountList::default_baseline(
+            Path::new("/home/u"),
+            Path::new("/home/u/proj"),
+        );
         let argv = bwrap_argv(&mounts, Path::new("/home/u/proj"), "true", &[]);
         assert!(argv.contains(&os("--die-with-parent")));
         assert!(argv.contains(&os("--new-session")));
@@ -210,8 +181,10 @@ mod tests {
 
     #[test]
     fn argv_translates_default_mounts() {
-        let mounts =
-            default_mount_list(Path::new("/home/u"), Path::new("/home/u/proj"));
+        let mounts = MountList::default_baseline(
+            Path::new("/home/u"),
+            Path::new("/home/u/proj"),
+        );
         let argv = bwrap_argv(&mounts, Path::new("/home/u/proj"), "true", &[]);
         assert_eq!(
             find_pair(&argv, "--ro-bind"),
@@ -229,8 +202,10 @@ mod tests {
 
     #[test]
     fn command_and_args_appear_after_double_dash() {
-        let mounts =
-            default_mount_list(Path::new("/home/u"), Path::new("/home/u/proj"));
+        let mounts = MountList::default_baseline(
+            Path::new("/home/u"),
+            Path::new("/home/u/proj"),
+        );
         let argv = bwrap_argv(
             &mounts,
             Path::new("/home/u/proj"),
