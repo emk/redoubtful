@@ -6,10 +6,10 @@
 //! Everything else exercises plumbing.
 //!
 //! `run_hides_unexpected_paths_in_home` consumes the binary's own
-//! `mounts --jsonl` output as the source of truth for what the
-//! sandbox is supposed to expose. We list `$HOME` *inside* the
-//! sandbox, then assert that every entry visible there corresponds
-//! to a mount the binary said it intended to expose.
+//! `show --json` output as the source of truth for what the sandbox
+//! is supposed to expose. We list `$HOME` *inside* the sandbox, then
+//! assert that every entry visible there corresponds to a mount the
+//! binary said it intended to expose.
 //!
 //! Caveat (deliberate): this test implicitly assumes the user's
 //! real `$HOME` is not magically empty. If it is, the assertion
@@ -93,12 +93,27 @@ fn read_sentinel_from_host(port: u16) -> String {
 /// Minimal struct mirroring `mounts::Mount` for deserialization.
 /// Defined here (not imported) because integration tests don't share
 /// crate-internal types — and the test should fail loudly if the
-/// JSONL shape changes unexpectedly.
+/// per-mount JSON shape changes unexpectedly.
 #[derive(serde::Deserialize)]
 struct MountJson {
     sandbox: PathBuf,
     // Other fields ignored — we only need `sandbox` for the
     // unexpected-paths assertion below.
+}
+
+/// Top-level shape of `redoubtful show --json`. Fields are split out
+/// per inventory so each test can grab just what it needs.
+#[derive(serde::Deserialize)]
+struct ShowJson {
+    mounts: Vec<MountJson>,
+    forwards: Vec<ForwardJson>,
+}
+
+/// Minimal struct mirroring `forward::Forward` for deserialization.
+#[derive(serde::Deserialize)]
+struct ForwardJson {
+    host_port: u16,
+    sandbox_port: u16,
 }
 
 #[test]
@@ -146,31 +161,29 @@ fn run_reports_missing_command() {
 }
 
 #[test]
-fn mounts_jsonl_is_parseable() {
-    let out = cmd().args(["mounts", "--jsonl"]).output().expect("mounts");
-    assert!(out.status.success(), "mounts --jsonl failed: {out:?}");
+fn show_json_is_parseable() {
+    let out = cmd().args(["show", "--json"]).output().expect("show");
+    assert!(out.status.success(), "show --json failed: {out:?}");
     let stdout = std::str::from_utf8(&out.stdout).expect("utf-8");
-    assert!(!stdout.is_empty(), "no mounts emitted");
-    for line in stdout.lines() {
-        let _: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("bad jsonl line {line:?}: {e}"));
-    }
+    let parsed: ShowJson = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("bad show json {stdout:?}: {e}"));
+    assert!(!parsed.mounts.is_empty(), "no mounts emitted");
+    // Empty `forwards` is the expected baseline — no `-f` was passed.
+    assert!(parsed.forwards.is_empty(), "unexpected forwards: {stdout}");
 }
 
 #[test]
 fn run_hides_unexpected_paths_in_home() {
     // (1) Ask the binary what it intends to expose.
-    let mounts_out =
-        cmd().args(["mounts", "--jsonl"]).output().expect("mounts");
+    let show_out = cmd().args(["show", "--json"]).output().expect("show");
     assert!(
-        mounts_out.status.success(),
-        "mounts --jsonl failed: {mounts_out:?}",
+        show_out.status.success(),
+        "show --json failed: {show_out:?}",
     );
-    let stdout = std::str::from_utf8(&mounts_out.stdout).expect("utf-8");
-    let mounts: Vec<MountJson> = stdout
-        .lines()
-        .map(|l| serde_json::from_str(l).expect("valid jsonl line"))
-        .collect();
+    let stdout = std::str::from_utf8(&show_out.stdout).expect("utf-8");
+    let parsed: ShowJson = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("bad show json {stdout:?}: {e}"));
+    let mounts = parsed.mounts;
     assert!(!mounts.is_empty(), "no mounts emitted");
 
     // (2) Compute the allowlist: the first path component of any
@@ -202,7 +215,7 @@ fn run_hides_unexpected_paths_in_home() {
         assert!(
             allowed.contains(*entry),
             "unexpected entry in sandboxed $HOME: {entry:?}\n  \
-             allowed (per `redoubtful mounts --jsonl`): {allowed:?}\n  \
+             allowed (per `redoubtful show --json`): {allowed:?}\n  \
              actual  (per `redoubtful run -- ls -A $HOME`): {actual:?}",
         );
     }
@@ -394,10 +407,10 @@ fn run_reports_missing_mount_host() {
         .stderr(contains("/no/such/path/redoubtful-test"));
 }
 
-// ===== Inventory subcommands =====
+// ===== `show` subcommand =====
 
 #[test]
-fn mounts_jsonl_includes_cli_mounts() {
+fn show_json_includes_cli_mounts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let host_file = dir.path().join("marker");
     std::fs::write(&host_file, b"x").expect("write marker");
@@ -405,14 +418,14 @@ fn mounts_jsonl_includes_cli_mounts() {
         format!("{}:{}", host_file.to_str().expect("utf-8"), "/work/marker",);
 
     let out = cmd()
-        .args(["mounts", "--jsonl", "-m", &spec])
+        .args(["show", "--json", "-m", &spec])
         .output()
-        .expect("mounts");
-    assert!(out.status.success(), "mounts --jsonl failed: {out:?}");
+        .expect("show");
+    assert!(out.status.success(), "show --json failed: {out:?}");
     let stdout = std::str::from_utf8(&out.stdout).expect("utf-8");
     assert!(
-        stdout.contains(r#""source":"cli""#),
-        "expected a cli-source mount line; got:\n{stdout}",
+        stdout.contains(r#""source": "cli""#),
+        "expected a cli-source mount entry; got:\n{stdout}",
     );
     assert!(
         stdout.contains("/work/marker"),
@@ -421,19 +434,22 @@ fn mounts_jsonl_includes_cli_mounts() {
 }
 
 #[test]
-fn forwards_jsonl_is_parseable() {
+fn show_json_includes_forwards() {
     let out = cmd()
-        .args(["forwards", "--jsonl", "-f", "8080", "-f", "5432:9999"])
+        .args(["show", "--json", "-f", "8080", "-f", "5432:9999"])
         .output()
-        .expect("forwards");
-    assert!(out.status.success(), "forwards --jsonl failed: {out:?}");
+        .expect("show");
+    assert!(out.status.success(), "show --json failed: {out:?}");
     let stdout = std::str::from_utf8(&out.stdout).expect("utf-8");
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 2, "expected 2 forward lines; got:\n{stdout}");
-    for line in &lines {
-        let _: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("bad jsonl line {line:?}: {e}"));
-    }
-    assert!(stdout.contains(r#""host_port":8080"#));
-    assert!(stdout.contains(r#""sandbox_port":9999"#));
+    let parsed: ShowJson = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("bad show json {stdout:?}: {e}"));
+    assert_eq!(
+        parsed.forwards.len(),
+        2,
+        "expected 2 forwards; got:\n{stdout}",
+    );
+    assert_eq!(parsed.forwards[0].host_port, 8080);
+    assert_eq!(parsed.forwards[0].sandbox_port, 8080);
+    assert_eq!(parsed.forwards[1].host_port, 5432);
+    assert_eq!(parsed.forwards[1].sandbox_port, 9999);
 }

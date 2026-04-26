@@ -29,11 +29,8 @@ enum Command {
     /// Run a command inside the sandbox.
     Run(cmd::run::Args),
 
-    /// Print the sandbox's mount inventory.
-    Mounts(cmd::mounts::Args),
-
-    /// Print the sandbox's TCP forward inventory.
-    Forwards(cmd::forwards::Args),
+    /// Print the sandbox config `run` would build.
+    Show(cmd::show::Args),
 }
 
 // We use `current_thread`, not the multi-thread default, on purpose: the pasta
@@ -93,11 +90,9 @@ async fn run() -> Result<()> {
             );
             cmd::run::cmd_run(args).await
         }
-        // `redoubtful mounts` only inspects what we'd construct, so it
+        // `redoubtful show` only inspects what we'd construct, so it
         // doesn't need bwrap/pasta to be installed.
-        Command::Mounts(args) => cmd::mounts::cmd_mounts(args).await,
-        // Same: `forwards` is a pure inspector.
-        Command::Forwards(args) => cmd::forwards::cmd_forwards(args).await,
+        Command::Show(args) => cmd::show::cmd_show(args).await,
     }
 }
 
