@@ -27,6 +27,7 @@ use tokio::process::Command;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::bwrap::bwrap_argv;
+use crate::env::{EnvList, EnvOpts};
 use crate::forward::{ForwardList, ForwardOpts};
 use crate::mounts::{MountList, MountOpts, current_dir, home_dir};
 use crate::pasta::pasta_argv;
@@ -42,6 +43,10 @@ pub struct Args {
     /// `-f, --forward` flags.
     #[command(flatten)]
     pub forward_opts: ForwardOpts,
+
+    /// `-e, --env` and `--path` flags.
+    #[command(flatten)]
+    pub env_opts: EnvOpts,
 
     /// The command to execute, e.g. `redoubtful run cargo build`.
     #[arg(value_name = "COMMAND")]
@@ -63,6 +68,7 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     let Args {
         mount_opts,
         forward_opts,
+        env_opts,
         command,
         args,
     } = args;
@@ -79,11 +85,25 @@ pub async fn cmd_run(args: Args) -> Result<()> {
         MountList::default_baseline(&home, &cwd, mount_opts.cwd_access());
     mount_opts.apply(&mut mounts);
 
-    let mut forwards = ForwardList::new();
+    let mut forwards = ForwardList::default_baseline();
     forward_opts.apply(&mut forwards);
 
+    // ----- Build the env inventory -----
+    //
+    // `default_baseline` resolves passthroughs against the host env
+    // now, so by the time we hand `&env` to bwrap_argv every entry
+    // has a concrete value. The same `home` path is reused for
+    // `$HOME` here and for the bind-mount layer above so env and
+    // mounts agree on where the agent's files live.
+    let mut env = EnvList::default_baseline(
+        &home,
+        env_opts.path.as_deref(),
+        &env_opts.path_add,
+    );
+    env_opts.apply(&mut env);
+
     // ----- Assemble bwrap and pasta argvs -----
-    let bwrap_args = bwrap_argv(&mounts, &cwd, &command, &args);
+    let bwrap_args = bwrap_argv(&mounts, &env, &cwd, &command, &args);
     let mut child_argv = Vec::with_capacity(bwrap_args.len().saturating_add(1));
     child_argv.push(OsString::from("bwrap"));
     child_argv.extend(bwrap_args);

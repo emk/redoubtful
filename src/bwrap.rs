@@ -27,15 +27,17 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use crate::argv::ArgvBuilder;
+use crate::env::EnvList;
 use crate::mounts::{MountAccess, MountKind, MountList};
 use crate::prelude::*;
 
 /// Build the full argv for `bwrap` (not including `bwrap` itself),
 /// ending with `-- <command> <args...>`.
 #[instrument(level = "debug", skip_all,
-    fields(command, n_mounts = mounts.len()))]
+    fields(command, n_mounts = mounts.len(), n_env = env.len()))]
 pub fn bwrap_argv(
     mounts: &MountList,
+    env: &EnvList,
     cwd: &Path,
     command: &str,
     args: &[String],
@@ -100,6 +102,33 @@ pub fn bwrap_argv(
     //   <https://nvd.nist.gov/vuln/detail/CVE-2017-5226>
     //   <https://man.archlinux.org/man/bwrap.1.en>
     a.flag("--new-session");
+
+    // ===== Environment =====
+    //
+    // --clearenv first, then an explicit --setenv NAME VALUE for
+    // each entry the inventory wants. The host's environment never
+    // reaches the sandbox by inheritance — every variable inside
+    // came from the curated baseline or an explicit `-e`/`--path`
+    // override. This is the credential-isolation boundary: no
+    // ANTHROPIC_API_KEY, GITHUB_TOKEN, SSH_AUTH_SOCK, etc. survives
+    // unless the user typed it on the command line.
+    //
+    // The `EnvList` is already resolved at this point — passthroughs
+    // were materialized against `std::env::var` when the list was
+    // built (see `crate::env`), so this layer is a straight
+    // translation with no host-env reads of its own. That keeps the
+    // mapping from inventory to argv mechanical and auditable, and
+    // means `redoubtful show --json` produces exactly the same
+    // entries the running sandbox sees.
+    //
+    //   bwrap(1) `--clearenv`, `--setenv`:
+    //     <https://man.archlinux.org/man/bwrap.1.en>
+    //   `specs/ARCHITECTURE.md`, "Environment variables set inside
+    //   the sandbox" + "The bwrap invocation".
+    a.flag("--clearenv");
+    for entry in env.iter() {
+        a.triple_str("--setenv", &entry.name, &entry.value);
+    }
 
     // ===== Mount inventory =====
     //
@@ -166,7 +195,9 @@ mod tests {
             Path::new("/home/u/proj"),
             MountAccess::Rw,
         );
-        let argv = bwrap_argv(&mounts, Path::new("/home/u/proj"), "true", &[]);
+        let env = EnvList::default_baseline(Path::new("/home/u"), None, &[]);
+        let argv =
+            bwrap_argv(&mounts, &env, Path::new("/home/u/proj"), "true", &[]);
         assert_eq!(argv.first(), Some(&os("--unshare-all")));
         assert_eq!(argv.get(1), Some(&os("--share-net")));
     }
@@ -178,7 +209,9 @@ mod tests {
             Path::new("/home/u/proj"),
             MountAccess::Rw,
         );
-        let argv = bwrap_argv(&mounts, Path::new("/home/u/proj"), "true", &[]);
+        let env = EnvList::default_baseline(Path::new("/home/u"), None, &[]);
+        let argv =
+            bwrap_argv(&mounts, &env, Path::new("/home/u/proj"), "true", &[]);
         assert!(argv.contains(&os("--die-with-parent")));
         assert!(argv.contains(&os("--new-session")));
     }
@@ -190,7 +223,9 @@ mod tests {
             Path::new("/home/u/proj"),
             MountAccess::Rw,
         );
-        let argv = bwrap_argv(&mounts, Path::new("/home/u/proj"), "true", &[]);
+        let env = EnvList::default_baseline(Path::new("/home/u"), None, &[]);
+        let argv =
+            bwrap_argv(&mounts, &env, Path::new("/home/u/proj"), "true", &[]);
         assert_eq!(
             find_pair(&argv, "--ro-bind"),
             Some((os("/usr"), os("/usr"))),
@@ -206,14 +241,74 @@ mod tests {
     }
 
     #[test]
+    fn argv_emits_clearenv_before_setenvs() {
+        // Regression-guard the credential-isolation property: every
+        // --setenv must come *after* --clearenv, otherwise the
+        // bwrap manpage says the setenv is undone when clearenv
+        // runs. (See `man bwrap`: "These options change in the
+        // order they are given.")
+        let mounts = MountList::default_baseline(
+            Path::new("/home/u"),
+            Path::new("/home/u/proj"),
+            MountAccess::Rw,
+        );
+        let mut env = EnvList::new();
+        env.set("FOO", "bar".to_owned(), crate::env::EnvSource::Default);
+        let argv =
+            bwrap_argv(&mounts, &env, Path::new("/home/u/proj"), "true", &[]);
+        let clear_idx = argv
+            .iter()
+            .position(|a| a.as_os_str() == OsStr::new("--clearenv"))
+            .expect("--clearenv emitted");
+        let setenv_idx = argv
+            .iter()
+            .position(|a| a.as_os_str() == OsStr::new("--setenv"))
+            .expect("--setenv emitted");
+        assert!(
+            clear_idx < setenv_idx,
+            "--clearenv must precede --setenv (clear={clear_idx}, set={setenv_idx})",
+        );
+    }
+
+    #[test]
+    fn argv_emits_setenv_per_entry_in_order() {
+        // The translation from EnvList to argv is a straight
+        // 1:1 emit; verify that two entries produce two
+        // --setenv NAME VALUE triples in order.
+        let mounts = MountList::default_baseline(
+            Path::new("/home/u"),
+            Path::new("/home/u/proj"),
+            MountAccess::Rw,
+        );
+        let mut env = EnvList::new();
+        env.set("ALPHA", "1".to_owned(), crate::env::EnvSource::Default);
+        env.set("BETA", "2".to_owned(), crate::env::EnvSource::Default);
+        let argv =
+            bwrap_argv(&mounts, &env, Path::new("/home/u/proj"), "true", &[]);
+        // Find the first --setenv occurrence; the next two args
+        // are name+value, then another --setenv with the next pair.
+        let first = argv
+            .iter()
+            .position(|a| a.as_os_str() == OsStr::new("--setenv"))
+            .expect("--setenv emitted");
+        assert_eq!(argv.get(first + 1), Some(&os("ALPHA")));
+        assert_eq!(argv.get(first + 2), Some(&os("1")));
+        assert_eq!(argv.get(first + 3), Some(&os("--setenv")));
+        assert_eq!(argv.get(first + 4), Some(&os("BETA")));
+        assert_eq!(argv.get(first + 5), Some(&os("2")));
+    }
+
+    #[test]
     fn command_and_args_appear_after_double_dash() {
         let mounts = MountList::default_baseline(
             Path::new("/home/u"),
             Path::new("/home/u/proj"),
             MountAccess::Rw,
         );
+        let env = EnvList::default_baseline(Path::new("/home/u"), None, &[]);
         let argv = bwrap_argv(
             &mounts,
+            &env,
             Path::new("/home/u/proj"),
             "echo",
             &["hello".to_string(), "world".to_string()],

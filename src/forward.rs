@@ -69,9 +69,29 @@ pub enum ForwardSource {
 pub struct ForwardList(Vec<Forward>);
 
 impl ForwardList {
-    /// An empty forward list — the default.
+    /// An empty forward list — for tests and other callers that
+    /// want to build the inventory entry-by-entry. Production
+    /// command paths should call [`Self::default_baseline`] so they
+    /// follow the same `default_baseline` + `opts.apply` shape that
+    /// `MountList` and `EnvList` use.
     pub fn new() -> Self {
         Self(Vec::new())
+    }
+
+    /// The curated baseline forward inventory `cmd::run`/`cmd::show`
+    /// start from before applying `-f` flags.
+    ///
+    /// Today this is just an empty list — there are no default
+    /// forwards (a fresh sandbox can't reach the host until the user
+    /// asks for a port). The wrapper exists for two reasons:
+    /// **interface symmetry** with `MountList::default_baseline` and
+    /// `EnvList::default_baseline` (every inventory has a
+    /// `default_baseline` + `opts.apply` shape), and **a stable
+    /// expansion point** — if we ever add automatic forwards (e.g.
+    /// the host's local DNS resolver), this is the function that
+    /// grows, not every call site.
+    pub fn default_baseline() -> Self {
+        Self::new()
     }
 
     /// Append a single TCP port forward.

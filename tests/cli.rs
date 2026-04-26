@@ -38,6 +38,27 @@ fn cmd() -> Command {
     c
 }
 
+/// `cmd()` with the test process's environment scrubbed. Used by env
+/// tests so they don't accidentally inherit (and then assert against)
+/// whatever the developer happens to have set in their shell —
+/// notably real `*_API_KEY` values, which would defeat the leak
+/// tests.
+///
+/// We re-set just the two host vars `redoubtful` itself needs:
+/// `HOME` (consumed by `home_dir()` during sandbox setup) and `PATH`
+/// (so the test process's `redoubtful` invocation can find `pasta`
+/// and `bwrap`). Everything else stays empty until tests opt in via
+/// `.env(...)`.
+fn cmd_clean() -> Command {
+    let mut c = cmd();
+    c.env_clear();
+    let home = std::env::var_os("HOME").expect("test process needs HOME");
+    let path = std::env::var_os("PATH").expect("test process needs PATH");
+    c.env("HOME", home);
+    c.env("PATH", path);
+    c
+}
+
 /// Sentinel string the host-side TCP stub writes to any client.
 /// Picked to be obviously unique so a `contains` check is reliable.
 const SENTINEL: &str = "redoubtful-sandbox-leak-sentinel-v1";
@@ -107,6 +128,7 @@ struct MountJson {
 struct ShowJson {
     mounts: Vec<MountJson>,
     forwards: Vec<ForwardJson>,
+    env: Vec<EnvJson>,
 }
 
 /// Minimal struct mirroring `forward::Forward` for deserialization.
@@ -114,6 +136,17 @@ struct ShowJson {
 struct ForwardJson {
     host_port: u16,
     sandbox_port: u16,
+}
+
+/// Minimal struct mirroring `env::EnvEntry` for deserialization. Each
+/// entry is a fully-resolved `name=value` pair; `show --json`
+/// describes exactly the env the sandbox would see at that instant
+/// (passthroughs are already materialized, unset ones are absent).
+#[derive(serde::Deserialize)]
+struct EnvJson {
+    name: String,
+    value: String,
+    source: String,
 }
 
 #[test]
@@ -452,4 +485,280 @@ fn show_json_includes_forwards() {
     assert_eq!(parsed.forwards[0].sandbox_port, 8080);
     assert_eq!(parsed.forwards[1].host_port, 5432);
     assert_eq!(parsed.forwards[1].sandbox_port, 9999);
+}
+
+// ===== Environment isolation =====
+//
+// The load-bearing assertion is `run_clears_host_credentials`: a
+// fake `*_API_KEY` set on the test process must NOT survive into the
+// sandbox. Everything else exercises the override surface (`-e`,
+// `--path`) and the consistency between `run`'s realized env and
+// `show --json`'s description.
+
+/// Fake-credential set in the test's environment must NOT appear
+/// inside the sandbox. This is the spec's
+/// `redoubtful run -- env | grep -i api_key` acceptance test
+/// (`specs/ARCHITECTURE.md`), realized as a positive guard.
+///
+/// We use a sentinel value (`"leaked-xyz-..."`) so a substring
+/// search is precise: a coincidental empty `printenv` output
+/// wouldn't be enough to claim the credential leaked. The
+/// `; echo done` marker proves the inner command actually ran (a
+/// silent setup failure also produces empty stdout — without the
+/// marker, that would look like a pass).
+#[test]
+fn run_clears_host_credentials() {
+    let out = cmd_clean()
+        .env("FAKE_API_KEY", "leaked-xyz-do-not-let-me-survive")
+        .args(["run", "sh", "-c", "printenv FAKE_API_KEY; echo done"])
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("done"),
+        "inner shell didn't complete; stdout: {stdout:?}, stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !stdout.contains("leaked-xyz"),
+        "FAKE_API_KEY leaked into the sandbox: {stdout:?}",
+    );
+}
+
+#[test]
+fn run_e_literal_sets_value() {
+    cmd_clean()
+        .args(["run", "-e", "FOO=bar", "printenv", "FOO"])
+        .assert()
+        .success()
+        .stdout(contains("bar"));
+}
+
+#[test]
+fn run_e_empty_value_is_literal_empty_string() {
+    // `-e FOO=` (with `=` but no value) sets FOO to the empty
+    // string. We use `[$FOO]` rather than just `$FOO` so the
+    // empty value is observable in stdout.
+    cmd_clean()
+        .args(["run", "-e", "FOO=", "sh", "-c", "echo \"[$FOO]\""])
+        .assert()
+        .success()
+        .stdout(contains("[]"));
+}
+
+#[test]
+fn run_e_passthrough_forwards_when_host_var_set() {
+    cmd_clean()
+        .env("MY_VAR", "yes-from-host")
+        .args(["run", "-e", "MY_VAR", "printenv", "MY_VAR"])
+        .assert()
+        .success()
+        .stdout(contains("yes-from-host"));
+}
+
+#[test]
+fn run_e_passthrough_drops_when_host_var_unset() {
+    // `-e MY_VAR` with `MY_VAR` unset on the host should produce a
+    // sandbox where `MY_VAR` is also unset. `printenv MY_VAR`
+    // exits 1 with empty stdout in that case; the `; echo done`
+    // marker proves the command actually ran.
+    let out = cmd_clean()
+        .args([
+            "run",
+            "-e",
+            "MY_VAR",
+            "sh",
+            "-c",
+            "printenv MY_VAR; echo done",
+        ])
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.as_ref(),
+        "done\n",
+        "stdout should be exactly 'done\\n'; got {stdout:?}",
+    );
+}
+
+#[test]
+fn run_default_path_is_canonical() {
+    cmd_clean()
+        .args(["run", "printenv", "PATH"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        ));
+}
+
+#[test]
+fn run_path_override_replaces_baseline_path() {
+    // The override sets a PATH that doesn't include `/usr/bin`,
+    // so we have to invoke `printenv` by absolute path — the
+    // shell's PATH lookup happens *inside* the sandbox using the
+    // overridden value.
+    cmd_clean()
+        .args([
+            "run",
+            "--path",
+            "/custom:/another",
+            "/usr/bin/printenv",
+            "PATH",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("/custom:/another"));
+}
+
+#[test]
+fn run_path_add_prepends_to_canonical() {
+    // `-p` should *prepend* to the canonical PATH (matches
+    // fish_add_path and `PATH=$DIR:$PATH`). After this call the
+    // sandbox PATH must contain both `/usr/bin` (canonical survives,
+    // so unqualified `printenv` still resolves) and the added
+    // directory, with the addition appearing first.
+    let out = cmd_clean()
+        .args(["run", "-p", "/opt/agent/bin", "printenv", "PATH"])
+        .output()
+        .expect("run");
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = std::str::from_utf8(&out.stdout).expect("utf-8");
+    assert!(
+        stdout.contains("/usr/bin"),
+        "canonical PATH must survive `-p`; got {stdout:?}",
+    );
+    assert!(
+        stdout.contains("/opt/agent/bin"),
+        "`-p` directory must be present; got {stdout:?}",
+    );
+    // Order: addition first, canonical after.
+    let added_idx = stdout
+        .find("/opt/agent/bin")
+        .expect("contains /opt/agent/bin");
+    let canonical_idx = stdout.find("/usr/bin").expect("contains /usr/bin");
+    assert!(
+        added_idx < canonical_idx,
+        "`-p` entries must precede canonical entries; got {stdout:?}",
+    );
+}
+
+#[test]
+fn run_path_add_repeatable_prepends_in_order() {
+    // Multiple `-p` flags prepend in CLI order: `-p /a -p /b` →
+    // `/a:/b:<canonical>`. Same convention as `fish_add_path /a /b`.
+    cmd_clean()
+        .args([
+            "run", "-p", "/first/bin", "-p", "/second/bin", "printenv", "PATH",
+        ])
+        .assert()
+        .success()
+        .stdout(contains(
+            "/first/bin:/second/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        ));
+}
+
+#[test]
+fn run_path_add_prepends_to_path_override() {
+    // `--path` plus `-p`: additions go in front of the override,
+    // same prepend semantics as the canonical case.
+    cmd_clean()
+        .args([
+            "run",
+            "--path",
+            "/only/this",
+            "-p",
+            "/extra",
+            "/usr/bin/printenv",
+            "PATH",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("/extra:/only/this"));
+}
+
+#[test]
+fn run_term_passthrough_forwards_value() {
+    cmd_clean()
+        .env("TERM", "xterm-256color")
+        .args(["run", "printenv", "TERM"])
+        .assert()
+        .success()
+        .stdout(contains("xterm-256color"));
+}
+
+#[test]
+fn run_e_literal_overrides_baseline_path() {
+    // Validates upsert semantics: `-e PATH=/only/this` must produce
+    // a sandbox with exactly that PATH (one entry, last write wins),
+    // not the canonical baseline + the override appended. Use
+    // /usr/bin/printenv since /only/this won't have it.
+    cmd_clean()
+        .args(["run", "-e", "PATH=/only/this", "/usr/bin/printenv", "PATH"])
+        .assert()
+        .success()
+        .stdout(contains("/only/this"));
+}
+
+#[test]
+fn show_json_includes_env() {
+    let out = cmd_clean()
+        .env("TERM", "xterm-256color")
+        .args(["show", "--json"])
+        .output()
+        .expect("show");
+    assert!(out.status.success(), "show --json failed: {out:?}");
+    let stdout = std::str::from_utf8(&out.stdout).expect("utf-8");
+    let parsed: ShowJson = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("bad show json {stdout:?}: {e}"));
+
+    let by_name = |name: &str| -> Option<&EnvJson> {
+        parsed.env.iter().find(|e| e.name == name)
+    };
+
+    let path = by_name("PATH").expect("PATH entry present");
+    assert_eq!(
+        path.value,
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
+    assert_eq!(path.source, "default");
+
+    let home = by_name("HOME").expect("HOME entry present");
+    assert_eq!(
+        home.value,
+        std::env::var("HOME").expect("test process needs HOME"),
+    );
+    assert_eq!(home.source, "default");
+
+    let term = by_name("TERM").expect("TERM entry present (passthrough)");
+    assert_eq!(term.value, "xterm-256color");
+    assert_eq!(term.source, "default");
+}
+
+#[test]
+fn show_json_omits_unset_passthroughs() {
+    // With cmd_clean(), only HOME and PATH are set on the test
+    // process; everything else in the curated passthrough list is
+    // unset. Those names should not appear in `show --json` output
+    // — passthroughs are resolved eagerly at construction, so an
+    // unset host var means no entry at all.
+    let out = cmd_clean().args(["show", "--json"]).output().expect("show");
+    assert!(out.status.success(), "show --json failed: {out:?}");
+    let stdout = std::str::from_utf8(&out.stdout).expect("utf-8");
+    let parsed: ShowJson = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("bad show json {stdout:?}: {e}"));
+    let names: HashSet<&str> =
+        parsed.env.iter().map(|e| e.name.as_str()).collect();
+
+    // PATH and HOME are always present; everything below is a
+    // passthrough that resolved to nothing under cmd_clean().
+    assert!(names.contains("PATH"));
+    assert!(names.contains("HOME"));
+    for absent in &["EDITOR", "VISUAL", "PAGER", "LC_ALL", "TZ"] {
+        assert!(
+            !names.contains(*absent),
+            "{absent:?} should be absent under a clean env; \
+             got names: {names:?}",
+        );
+    }
 }

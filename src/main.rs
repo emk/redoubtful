@@ -4,6 +4,7 @@ mod argv;
 mod bwrap;
 mod cmd;
 mod deps;
+mod env;
 mod errors;
 mod forward;
 mod mounts;

@@ -10,6 +10,7 @@ use std::io::{self, Write as _};
 
 use serde::Serialize;
 
+use crate::env::{EnvList, EnvOpts};
 use crate::forward::{ForwardList, ForwardOpts};
 use crate::mounts::{MountList, MountOpts, current_dir, home_dir};
 use crate::prelude::*;
@@ -32,13 +33,18 @@ pub struct Args {
     /// `-f, --forward` flags, mirrored from `run`.
     #[command(flatten)]
     pub forward_opts: ForwardOpts,
+
+    /// `-e, --env` and `--path` flags, mirrored from `run`.
+    #[command(flatten)]
+    pub env_opts: EnvOpts,
 }
 
-/// Top-level JSON envelope: one object holding both inventories.
+/// Top-level JSON envelope: one object holding all inventories.
 #[derive(Serialize)]
 struct Output<'a> {
     mounts: &'a MountList,
     forwards: &'a ForwardList,
+    env: &'a EnvList,
 }
 
 /// Print the sandbox config `run` would build.
@@ -48,6 +54,7 @@ pub async fn cmd_show(args: Args) -> Result<()> {
         json: _,
         mount_opts,
         forward_opts,
+        env_opts,
     } = args;
 
     // Validate first so a bad CLI mount fails before any output —
@@ -60,12 +67,24 @@ pub async fn cmd_show(args: Args) -> Result<()> {
         MountList::default_baseline(&home, &cwd, mount_opts.cwd_access());
     mount_opts.apply(&mut mounts);
 
-    let mut forwards = ForwardList::new();
+    let mut forwards = ForwardList::default_baseline();
     forward_opts.apply(&mut forwards);
+
+    // Mirror `cmd_run`'s env construction so `show --json` describes
+    // exactly what `run` would emit at this same instant — same
+    // `home` path goes into `default_baseline` so the env and the
+    // mount layer agree on `$HOME`.
+    let mut env = EnvList::default_baseline(
+        &home,
+        env_opts.path.as_deref(),
+        &env_opts.path_add,
+    );
+    env_opts.apply(&mut env);
 
     let body = Output {
         mounts: &mounts,
         forwards: &forwards,
+        env: &env,
     };
     // `serde_json::to_string_pretty` is infallible for `Output` (no
     // maps with non-string keys, no float NaN/Inf, no custom

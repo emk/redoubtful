@@ -67,6 +67,17 @@ impl ArgvBuilder {
         self.argv.push(OsString::from(value));
     }
 
+    /// Append `flag` followed by two string operands
+    /// (e.g. `--setenv PATH /usr/bin`). Bwrap's `--setenv` takes the
+    /// name and value as separate argv tokens, so a 2-string pair
+    /// helper avoids reconstructing `OsString` boilerplate at the
+    /// call site.
+    pub fn triple_str(&mut self, flag: &str, a: &str, b: &str) {
+        self.argv.push(OsString::from(flag));
+        self.argv.push(OsString::from(a));
+        self.argv.push(OsString::from(b));
+    }
+
     /// Append a sequence of pre-built `OsString` tokens verbatim.
     /// Used for the inner command's argv, which we already have as
     /// `Vec<OsString>`.
