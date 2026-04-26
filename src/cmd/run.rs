@@ -88,6 +88,7 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     child_argv.push(OsString::from("bwrap"));
     child_argv.extend(bwrap_args);
     let pasta_args = pasta_argv(&forwards, child_argv);
+    debug!(cmd = "pasta", args = ?pasta_args, "running sandbox");
 
     // ----- Spawn pasta with PR_SET_PDEATHSIG -----
     //
