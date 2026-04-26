@@ -9,7 +9,7 @@
 //!
 //! `MountOpts` is flattened in here so `mounts --jsonl -m /foo`
 //! reflects user-added mounts too — otherwise the audit/test
-//! allowlist would silently miss anything passed via `-m`/`--mount-rw`
+//! allowlist would silently miss anything passed via `-m`/`--readonly`
 //! at `run` time.
 
 use std::io::{self, Write as _};
@@ -26,7 +26,7 @@ pub struct Args {
     #[arg(long, required = true)]
     pub jsonl: bool,
 
-    /// `-m, --mount` and `--mount-rw` flags, mirrored from `run`
+    /// `-m, --mount` and `--readonly` flags, mirrored from `run`
     /// so the inventory output reflects whatever mounts the user
     /// would get with the same flags.
     #[command(flatten)]
@@ -47,7 +47,8 @@ pub async fn cmd_mounts(args: Args) -> Result<()> {
 
     let home = home_dir()?;
     let cwd = current_dir()?;
-    let mut mounts = MountList::default_baseline(&home, &cwd);
+    let mut mounts =
+        MountList::default_baseline(&home, &cwd, mount_opts.cwd_access());
     mount_opts.apply(&mut mounts);
 
     let stdout = io::stdout();

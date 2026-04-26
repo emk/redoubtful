@@ -91,7 +91,7 @@ pub enum Error {
         source: io::Error,
     },
 
-    /// A `-m`/`--mount-rw` host path could not be stat'ed.
+    /// A `-m`/`--mount` host path could not be stat'ed.
     /// Stat'd up-front in `MountOpts::validate` so the user gets
     /// a clear diagnostic instead of bwrap's terser failure deep
     /// inside sandbox setup.

@@ -45,9 +45,9 @@ pub struct Mount {
     /// Absolute path inside the sandbox where this mount appears.
     pub sandbox: PathBuf,
 
-    /// Kind of mount (with any host path or symlink target it carries).
-    /// Flattened so JSONL lines look like
-    /// `{"sandbox": "...", "kind": "mount-ro", "host": "...", "source": "..."}`.
+    /// Kind of mount (with any host path, symlink target, or access
+    /// mode it carries). Flattened so JSONL lines look like
+    /// `{"sandbox": "...", "kind": "mount", "host": "...", "access": "ro", "source": "..."}`.
     #[serde(flatten)]
     pub kind: MountKind,
 
@@ -59,22 +59,20 @@ pub struct Mount {
 
 /// The subset of bwrap mount kinds we use.
 ///
-/// Variant names mirror our public CLI surface (`-m, --mount` and
-/// `--mount-rw`) rather than bwrap's flag names, since the CLI is
-/// what users see; the bwrap flag-name translation lives in
-/// [`crate::bwrap`].
+/// The `Mount` variant covers both access modes the CLI exposes
+/// (`-m, --mount HOST[:SANDBOX[:rw|:ro]]`) via its [`MountAccess`]
+/// field; the bwrap flag-name translation (`--bind`/`--ro-bind`)
+/// lives in [`crate::bwrap`].
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum MountKind {
-    /// Read-only bind from the host (translated to bwrap `--ro-bind`).
-    MountRo {
+    /// Bind mount from the host. Translated to bwrap `--bind` (rw)
+    /// or `--ro-bind` (ro) depending on `access`.
+    Mount {
         /// Host path being bound.
         host: PathBuf,
-    },
-    /// Read-write bind from the host (translated to bwrap `--bind`).
-    MountRw {
-        /// Host path being bound.
-        host: PathBuf,
+        /// Whether the mount is read-only or read-write.
+        access: MountAccess,
     },
     /// Symlink at `sandbox` pointing to `target` (`--symlink`).
     Symlink {
@@ -90,6 +88,22 @@ pub enum MountKind {
     Proc,
 }
 
+/// Whether a bind mount exposes the host path read-only or read-write.
+///
+/// Encoded in the `:rw|:ro` suffix of `-m, --mount` for CLI mounts,
+/// in `--readonly` for the cwd bind, and in the `access` field of
+/// the JSONL emitted by `redoubtful mounts --jsonl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MountAccess {
+    /// Read-only — translated to bwrap `--ro-bind`. The default for
+    /// `-m` if no suffix is given.
+    Ro,
+    /// Read-write — translated to bwrap `--bind`. **Use sparingly**
+    /// — a writeable mount is a hole in the sandbox by design.
+    Rw,
+}
+
 /// Provenance of a mount — extensible.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -98,7 +112,7 @@ pub enum MountSource {
     Default,
     /// The project directory the user invoked us from (`$PWD`).
     Cwd,
-    /// Added via a `-m`/`--mount-rw` CLI flag.
+    /// Added via a `-m`/`--mount` CLI flag.
     Cli,
     // Future: Config { path: PathBuf }, NamedProfile { name: String }, etc.
 }
@@ -130,13 +144,18 @@ impl MountList {
 
     /// The hardcoded mount baseline every sandbox starts from:
     /// read-only `/usr` (with the standard top-level symlinks),
-    /// `/dev` `/proc` `/tmp`, then `--tmpfs $HOME` followed by
-    /// `--bind $PWD $PWD`.
+    /// `/dev` `/proc` `/tmp`, then `--tmpfs $HOME` followed by a
+    /// `$PWD $PWD` bind whose access mode comes from `cwd_access`
+    /// (read-write by default; read-only via `--readonly`).
     ///
     /// Order is load-bearing — the `$HOME` tmpfs must precede the
     /// `$PWD` bind so the bind punches through the tmpfs rather than
     /// the other way around.
-    pub fn default_baseline(home: &Path, cwd: &Path) -> Self {
+    pub fn default_baseline(
+        home: &Path,
+        cwd: &Path,
+        cwd_access: MountAccess,
+    ) -> Self {
         let mut list = Self::new();
 
         // ----- Read-only system filesystem -----
@@ -162,7 +181,7 @@ impl MountList {
         // need them (TLS → /etc/ssl/certs/; git → /etc/gitconfig;
         // user-aware tooling → a synthetic /etc/passwd written via
         // FD à la the bwrap demo).
-        list.mount_ro("/usr", "/usr", MountSource::Default);
+        list.mount("/usr", "/usr", MountAccess::Ro, MountSource::Default);
         list.symlink("/bin", "usr/bin", MountSource::Default);
         list.symlink("/sbin", "usr/sbin", MountSource::Default);
         list.symlink("/lib", "usr/lib", MountSource::Default);
@@ -207,8 +226,8 @@ impl MountList {
         // Order: this tmpfs must come before the bind below, so the
         // bind overlays it (project dir punches through the tmpfs)
         // rather than the other way around. CLI mounts appended later
-        // by [`MountList::extend_from_cli`] are similarly later in the
-        // list, so they too punch through.
+        // by [`MountOpts::apply`] are similarly later in the list, so
+        // they too punch through.
         //
         // Known limitation: if $PWD == $HOME, the bind would re-
         // expose the real $HOME on top of the tmpfs and defeat the
@@ -216,36 +235,25 @@ impl MountList {
         //
         //   `specs/ARCHITECTURE.md` ("Filesystem layout inside the sandbox")
         list.tmpfs(home, MountSource::Default);
-        list.mount_rw(cwd, cwd, MountSource::Cwd);
+        list.mount(cwd, cwd, cwd_access, MountSource::Cwd);
 
         list
     }
 
-    /// Append a read-only bind mount.
-    pub fn mount_ro(
+    /// Append a bind mount with the given [`MountAccess`].
+    pub fn mount(
         &mut self,
         sandbox: impl Into<PathBuf>,
         host: impl Into<PathBuf>,
+        access: MountAccess,
         source: MountSource,
     ) -> &mut Self {
         self.0.push(Mount {
             sandbox: sandbox.into(),
-            kind: MountKind::MountRo { host: host.into() },
-            source,
-        });
-        self
-    }
-
-    /// Append a read-write bind mount.
-    pub fn mount_rw(
-        &mut self,
-        sandbox: impl Into<PathBuf>,
-        host: impl Into<PathBuf>,
-        source: MountSource,
-    ) -> &mut Self {
-        self.0.push(Mount {
-            sandbox: sandbox.into(),
-            kind: MountKind::MountRw { host: host.into() },
+            kind: MountKind::Mount {
+                host: host.into(),
+                access,
+            },
             source,
         });
         self
@@ -322,11 +330,12 @@ impl MountList {
     }
 }
 
-/// A single CLI-supplied bind-mount specification: a host path and
-/// the sandbox path it should appear at.
+/// A single CLI-supplied bind-mount specification: a host path,
+/// the sandbox path it should appear at, and whether to expose it
+/// read-only (the default) or read-write.
 ///
-/// Parses from `HOST_PATH[:SANDBOX_PATH]` via [`FromStr`], which
-/// clap picks up automatically.
+/// Parses from `HOST_PATH[:SANDBOX_PATH[:rw|:ro]]` via [`FromStr`],
+/// which clap picks up automatically.
 #[derive(Debug, Clone)]
 pub struct MountSpec {
     /// Absolute path on the host being bind-mounted in.
@@ -334,29 +343,44 @@ pub struct MountSpec {
 
     /// Absolute path inside the sandbox where it should appear.
     pub sandbox: PathBuf,
+
+    /// Whether the mount is read-only or read-write.
+    pub access: MountAccess,
 }
 
 impl FromStr for MountSpec {
     type Err = String;
 
-    /// Parse a `HOST_PATH[:SANDBOX_PATH]` mount specification.
+    /// Parse a `HOST_PATH[:SANDBOX_PATH[:rw|:ro]]` mount specification.
     ///
     /// If only one path is given, the sandbox path equals the host
-    /// path (the common case for `-m ~/.gitconfig`). At most one
-    /// `:` is permitted today — additional colons are reserved for
-    /// future extensions (mount options, e.g. Docker's `:ro`).
-    /// Both halves must be absolute paths starting with `/`;
-    /// relative paths are nonsense for bind mounts and the early
-    /// failure is more helpful than bwrap's later one.
+    /// path (the common case for `-m ~/.gitconfig`). The optional
+    /// third part must be exactly `ro` or `rw`; if omitted, the
+    /// default is read-only. Four-or-more-colon syntax is reserved
+    /// for future extensions. Both path halves must be absolute
+    /// (`/`-prefixed); relative paths are nonsense for bind mounts
+    /// and the early failure is more helpful than bwrap's later one.
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.splitn(3, ':').collect();
-        let (host, sandbox) = match parts.as_slice() {
-            [single] => (*single, *single),
-            [host, sandbox] => (*host, *sandbox),
+        let parts: Vec<&str> = s.splitn(4, ':').collect();
+        let (host, sandbox, access) = match parts.as_slice() {
+            [single] => (*single, *single, MountAccess::Ro),
+            [host, sandbox] => (*host, *sandbox, MountAccess::Ro),
+            [host, sandbox, access] => {
+                let access = match *access {
+                    "ro" => MountAccess::Ro,
+                    "rw" => MountAccess::Rw,
+                    other => {
+                        return Err(format!(
+                            "mount access {other:?} must be `ro` or `rw`"
+                        ));
+                    }
+                };
+                (*host, *sandbox, access)
+            }
             _ => {
                 return Err(format!(
-                    "mount spec {s:?} contains more than one `:`; \
-                     multi-colon syntax is reserved for future use"
+                    "mount spec {s:?} contains more than two `:`; \
+                     additional colons are reserved for future use"
                 ));
             }
         };
@@ -379,6 +403,7 @@ impl FromStr for MountSpec {
         Ok(MountSpec {
             host: PathBuf::from(host),
             sandbox: PathBuf::from(sandbox),
+            access,
         })
     }
 }
@@ -391,22 +416,24 @@ impl FromStr for MountSpec {
 /// sync with the runtime.
 #[derive(Debug, Clone, Default, clap::Args)]
 pub struct MountOpts {
-    /// Bind a host path read-only into the sandbox. Repeatable.
-    /// Format: `HOST_PATH[:SANDBOX_PATH]`. If `:SANDBOX_PATH` is
-    /// omitted, the sandbox path equals the host path.
+    /// Bind a host path into the sandbox. Repeatable. Format:
+    /// `HOST_PATH[:SANDBOX_PATH[:rw|:ro]]`. Default access is
+    /// read-only; pass `:rw` to allow the sandboxed process to
+    /// modify the host path. **Use `:rw` sparingly** — a writeable
+    /// mount is a hole in the sandbox by design.
     #[arg(
         short = 'm',
         long = "mount",
-        value_name = "HOST_PATH[:SANDBOX_PATH]"
+        value_name = "HOST_PATH[:SANDBOX_PATH[:rw|:ro]]"
     )]
     pub mount: Vec<MountSpec>,
 
-    /// Bind a host path read-write into the sandbox. Repeatable.
-    /// Format: `HOST_PATH[:SANDBOX_PATH]`. **Use sparingly** — a
-    /// writeable mount is a hole in the sandbox by design; the agent
-    /// can modify anything inside it.
-    #[arg(long = "mount-rw", value_name = "HOST_PATH[:SANDBOX_PATH]")]
-    pub mount_rw: Vec<MountSpec>,
+    /// Mount the working directory read-only instead of read-write.
+    /// Useful for exploratory agents that should be able to read the
+    /// project but not modify it. Does not affect `-m` mounts —
+    /// those carry their own access mode in the spec.
+    #[arg(long = "readonly")]
+    pub readonly: bool,
 }
 
 impl MountOpts {
@@ -414,29 +441,33 @@ impl MountOpts {
     /// any are missing. Without this, the user gets bwrap's terser
     /// `Can't find source path` failure deep inside sandbox setup.
     pub fn validate(&self) -> Result<()> {
-        for spec in self.mount.iter().chain(self.mount_rw.iter()) {
+        for spec in &self.mount {
             std::fs::metadata(&spec.host)
                 .map_err(|e| Error::missing_mount_host(spec.host.clone(), e))?;
         }
         Ok(())
     }
 
-    /// Append CLI mounts to a [`MountList`]. Read-only mounts first,
-    /// then read-write — order between the two doesn't matter for
-    /// non-overlapping paths, and the deterministic ordering keeps
-    /// the JSONL output predictable.
+    /// The access mode the cwd bind should use given `--readonly`.
+    /// Pass to [`MountList::default_baseline`].
+    pub fn cwd_access(&self) -> MountAccess {
+        if self.readonly {
+            MountAccess::Ro
+        } else {
+            MountAccess::Rw
+        }
+    }
+
+    /// Append CLI mounts to a [`MountList`] in CLI order. Each
+    /// mount's access mode (ro vs rw) comes from its own
+    /// [`MountSpec::access`], which means later `-m` flags overlay
+    /// earlier ones the same way bwrap argv-order does.
     pub fn apply(&self, list: &mut MountList) {
         for spec in &self.mount {
-            list.mount_ro(
+            list.mount(
                 spec.sandbox.clone(),
                 spec.host.clone(),
-                MountSource::Cli,
-            );
-        }
-        for spec in &self.mount_rw {
-            list.mount_rw(
-                spec.sandbox.clone(),
-                spec.host.clone(),
+                spec.access,
                 MountSource::Cli,
             );
         }
@@ -463,7 +494,7 @@ mod tests {
     fn default_list_orders_home_tmpfs_before_cwd_bind() {
         let home = Path::new("/home/u");
         let cwd = Path::new("/home/u/proj");
-        let mounts = MountList::default_baseline(home, cwd);
+        let mounts = MountList::default_baseline(home, cwd, MountAccess::Rw);
 
         let home_idx = mounts
             .iter()
@@ -474,7 +505,14 @@ mod tests {
         let cwd_idx = mounts
             .iter()
             .position(|m| {
-                m.sandbox == cwd && matches!(m.kind, MountKind::MountRw { .. })
+                m.sandbox == cwd
+                    && matches!(
+                        m.kind,
+                        MountKind::Mount {
+                            access: MountAccess::Rw,
+                            ..
+                        }
+                    )
             })
             .expect("cwd bind entry");
         assert!(
@@ -484,18 +522,46 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_serialization_uses_kebab_case_kinds() {
+    fn default_baseline_honors_cwd_access_ro() {
+        let cwd = Path::new("/home/u/proj");
+        let mounts = MountList::default_baseline(
+            Path::new("/home/u"),
+            cwd,
+            MountAccess::Ro,
+        );
+        let cwd_entry = mounts
+            .iter()
+            .find(|m| matches!(m.source, MountSource::Cwd))
+            .expect("cwd entry");
+        assert!(
+            matches!(
+                cwd_entry.kind,
+                MountKind::Mount {
+                    access: MountAccess::Ro,
+                    ..
+                }
+            ),
+            "cwd_access::Ro must produce a Mount{{access:Ro}} entry, got {:?}",
+            cwd_entry.kind,
+        );
+    }
+
+    #[test]
+    fn jsonl_serialization_emits_expected_shapes() {
         let mounts = MountList::default_baseline(
             Path::new("/home/u"),
             Path::new("/home/u/proj"),
+            MountAccess::Rw,
         );
         let lines: Vec<String> = mounts
             .iter()
             .map(|m| serde_json::to_string(m).expect("serializes"))
             .collect();
-        // Spot-check a few representative shapes.
-        assert!(lines.iter().any(|l| l.contains(r#""kind":"mount-ro""#)));
-        assert!(lines.iter().any(|l| l.contains(r#""kind":"mount-rw""#)));
+        // Spot-check a few representative shapes. The `mount` kind
+        // carries an `access` field whose values are lowercased.
+        assert!(lines.iter().any(|l| l.contains(r#""kind":"mount""#)));
+        assert!(lines.iter().any(|l| l.contains(r#""access":"ro""#)));
+        assert!(lines.iter().any(|l| l.contains(r#""access":"rw""#)));
         assert!(lines.iter().any(|l| l.contains(r#""kind":"symlink""#)));
         assert!(lines.iter().any(|l| l.contains(r#""kind":"tmpfs""#)));
         assert!(lines.iter().any(|l| l.contains(r#""kind":"dev""#)));
@@ -508,14 +574,16 @@ mod tests {
     fn cli_mounts_appended_after_default_home_tmpfs() {
         let home = Path::new("/home/u");
         let cwd = Path::new("/home/u/proj");
-        let mut mounts = MountList::default_baseline(home, cwd);
+        let mut mounts =
+            MountList::default_baseline(home, cwd, MountAccess::Rw);
 
         let opts = MountOpts {
             mount: vec![MountSpec {
                 host: PathBuf::from("/home/u/.gitconfig"),
                 sandbox: PathBuf::from("/home/u/.gitconfig"),
+                access: MountAccess::Ro,
             }],
-            mount_rw: vec![],
+            readonly: false,
         };
         opts.apply(&mut mounts);
 
@@ -535,6 +603,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cwd_access_reflects_readonly_flag() {
+        let mut opts = MountOpts::default();
+        assert_eq!(opts.cwd_access(), MountAccess::Rw);
+        opts.readonly = true;
+        assert_eq!(opts.cwd_access(), MountAccess::Ro);
+    }
+
     fn parse(s: &str) -> std::result::Result<MountSpec, String> {
         s.parse()
     }
@@ -544,6 +620,7 @@ mod tests {
         let spec = parse("/home/u/.gitconfig").expect("parses");
         assert_eq!(spec.host, PathBuf::from("/home/u/.gitconfig"));
         assert_eq!(spec.sandbox, PathBuf::from("/home/u/.gitconfig"));
+        assert_eq!(spec.access, MountAccess::Ro);
     }
 
     #[test]
@@ -551,14 +628,31 @@ mod tests {
         let spec = parse("/host/x:/sandbox/y").expect("parses");
         assert_eq!(spec.host, PathBuf::from("/host/x"));
         assert_eq!(spec.sandbox, PathBuf::from("/sandbox/y"));
+        assert_eq!(spec.access, MountAccess::Ro);
     }
 
     #[test]
-    fn mount_spec_rejects_multiple_colons() {
-        // Reserved for future syntax (mount options, etc.).
-        let err = parse("/host/x:/sandbox/y:ro")
-            .expect_err("multi-colon should be rejected");
-        assert!(err.contains("more than one `:`"), "{err}");
+    fn mount_spec_accepts_explicit_rw_and_ro_suffix() {
+        let rw = parse("/host/x:/sandbox/y:rw").expect("parses :rw");
+        assert_eq!(rw.access, MountAccess::Rw);
+        let ro = parse("/host/x:/sandbox/y:ro").expect("parses :ro");
+        assert_eq!(ro.access, MountAccess::Ro);
+    }
+
+    #[test]
+    fn mount_spec_rejects_invalid_access_token() {
+        let err = parse("/host/x:/sandbox/y:wat")
+            .expect_err("bogus access token should be rejected");
+        assert!(err.contains("\"wat\""), "{err}");
+        assert!(err.contains("ro") && err.contains("rw"), "{err}");
+    }
+
+    #[test]
+    fn mount_spec_rejects_too_many_colons() {
+        // Three colons is now valid (it's the access suffix); four is not.
+        let err = parse("/host/x:/sandbox/y:rw:extra")
+            .expect_err("four-segment spec should be rejected");
+        assert!(err.contains("more than two `:`"), "{err}");
     }
 
     #[test]

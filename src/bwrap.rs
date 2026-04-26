@@ -27,7 +27,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use crate::argv::ArgvBuilder;
-use crate::mounts::{MountKind, MountList};
+use crate::mounts::{MountAccess, MountKind, MountList};
 use crate::prelude::*;
 
 /// Build the full argv for `bwrap` (not including `bwrap` itself),
@@ -107,11 +107,12 @@ pub fn bwrap_argv(
     // semantic decisions live there with auditability comments.
     for m in mounts.iter() {
         match &m.kind {
-            MountKind::MountRo { host } => {
-                a.pair_path("--ro-bind", host, &m.sandbox)
-            }
-            MountKind::MountRw { host } => {
-                a.pair_path("--bind", host, &m.sandbox)
+            MountKind::Mount { host, access } => {
+                let flag = match access {
+                    MountAccess::Ro => "--ro-bind",
+                    MountAccess::Rw => "--bind",
+                };
+                a.pair_path(flag, host, &m.sandbox);
             }
             MountKind::Symlink { target } => {
                 a.pair_str_path("--symlink", target, &m.sandbox);
@@ -140,6 +141,7 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+    use crate::mounts::MountAccess;
 
     fn os(s: &str) -> OsString {
         OsString::from(s)
@@ -162,6 +164,7 @@ mod tests {
         let mounts = MountList::default_baseline(
             Path::new("/home/u"),
             Path::new("/home/u/proj"),
+            MountAccess::Rw,
         );
         let argv = bwrap_argv(&mounts, Path::new("/home/u/proj"), "true", &[]);
         assert_eq!(argv.first(), Some(&os("--unshare-all")));
@@ -173,6 +176,7 @@ mod tests {
         let mounts = MountList::default_baseline(
             Path::new("/home/u"),
             Path::new("/home/u/proj"),
+            MountAccess::Rw,
         );
         let argv = bwrap_argv(&mounts, Path::new("/home/u/proj"), "true", &[]);
         assert!(argv.contains(&os("--die-with-parent")));
@@ -184,6 +188,7 @@ mod tests {
         let mounts = MountList::default_baseline(
             Path::new("/home/u"),
             Path::new("/home/u/proj"),
+            MountAccess::Rw,
         );
         let argv = bwrap_argv(&mounts, Path::new("/home/u/proj"), "true", &[]);
         assert_eq!(
@@ -205,6 +210,7 @@ mod tests {
         let mounts = MountList::default_baseline(
             Path::new("/home/u"),
             Path::new("/home/u/proj"),
+            MountAccess::Rw,
         );
         let argv = bwrap_argv(
             &mounts,

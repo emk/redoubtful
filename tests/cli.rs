@@ -345,7 +345,7 @@ fn mount_rw_allows_writes_to_host_path() {
     std::fs::write(&host_file, b"original\n").expect("write marker");
 
     let spec = format!(
-        "{}:{}",
+        "{}:{}:rw",
         host_file.to_str().expect("utf-8 host"),
         "/work/marker",
     );
@@ -353,7 +353,7 @@ fn mount_rw_allows_writes_to_host_path() {
     cmd()
         .args([
             "run",
-            "--mount-rw",
+            "-m",
             &spec,
             "bash",
             "-c",
@@ -364,6 +364,25 @@ fn mount_rw_allows_writes_to_host_path() {
 
     let on_disk = std::fs::read_to_string(&host_file).expect("read marker");
     assert_eq!(on_disk.trim(), "from-sandbox");
+}
+
+#[test]
+fn cwd_readonly_blocks_writes_with_flag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Run inside the tempdir so cwd == dir.path().
+    let out = cmd()
+        .current_dir(dir.path())
+        .args(["run", "--readonly", "bash", "-c", "echo evil > ./marker"])
+        .output()
+        .expect("write attempt");
+    assert!(
+        !out.status.success(),
+        "writing to cwd under --readonly should fail; got {out:?}",
+    );
+    assert!(
+        !dir.path().join("marker").exists(),
+        "no marker file should be created on the host under --readonly",
+    );
 }
 
 #[test]

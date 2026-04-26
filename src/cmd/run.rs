@@ -35,7 +35,7 @@ use crate::prelude::*;
 /// Arguments to `redoubtful run`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// `-m, --mount` and `--mount-rw` flags.
+    /// `-m, --mount` and `--readonly` flags.
     #[command(flatten)]
     pub mount_opts: MountOpts,
 
@@ -75,7 +75,8 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     // ----- Build the mount and forward inventories -----
     let home = home_dir()?;
     let cwd = current_dir()?;
-    let mut mounts = MountList::default_baseline(&home, &cwd);
+    let mut mounts =
+        MountList::default_baseline(&home, &cwd, mount_opts.cwd_access());
     mount_opts.apply(&mut mounts);
 
     let mut forwards = ForwardList::new();
