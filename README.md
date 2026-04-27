@@ -5,8 +5,8 @@ _**WARNING:** This is incomplete work-in-progress, and nearly all of the code wa
 `redoubtful` is designed to be a lightweight agent sandbox that tries to make it semi-reasonable to use `--dangerously-skip-permissions`. It uses `pasta` and `bwrap` to:
 
 - Create a fake filesystem that contains a highly restricted view of the real filesystem. (But we preserve paths and file ownership, so `git worktree` should work.)
+- Clean up environment variables to prevent credential leakage.
 - Control network access.
-- Clean up environment variables.
 - TODO: Run an HTTPS proxy which holds actual network credentials.
 
 This is _not_ trying to be a Docker container, or a browser-style security sandbox. This is designed to let you take a small local model and `--dangerously-skip-permissions` (etc) and hopefully not burn down anything besides the current working directory. 
@@ -71,7 +71,7 @@ This gives `redoubtful` the same permissions as something like Firefox or `flatp
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=1
 ```
 
-...and you may actually get somewhere.
+...and you may actually get somewhere. We may expand on this in the future, or explore other sandboxing mechanisms.
 
 **A worse alternative.** If you don't mind opening up a whole bunch of attack surface, you could always do:
 
