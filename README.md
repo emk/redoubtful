@@ -25,10 +25,10 @@ You can run `opencode` in the sandbox using:
 ```
 redoubtful run \
     -m ~/.opencode -m ~/.config/opencode -p ~/.opencode/bin \
-    -f 8080 --readonly opencode
+    -f 8080 opencode
 ```
 
-This will map `localhost:8080` into the sandbox (for `llama-server`), and set up your mount points and paths to run `opencode`. Eventually it would be nice to offer named profiles so you didn't need to type all this.
+The `-f 8080` will map `localhost:8080` into the sandbox (for `llama-server`), and set up your mount points and paths to run `opencode`. Eventually it would be nice to offer named profiles so you didn't need to type all this.
 
 ## Installation (Linux)
 
