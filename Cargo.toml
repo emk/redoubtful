@@ -1,7 +1,11 @@
 [package]
 name = "redoubtful"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+# Basically almost none of this code was typed by human hands, so
+# you'd have to consult a lawyer to figure out the copyright status. But
+# to whatever extent it is copyrightable by me, the following license
+# applies.
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -12,7 +16,12 @@ miette = { version = "7.6.0", features = ["fancy"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
-tokio = { version = "1.52.1", features = ["macros", "process", "rt-multi-thread", "signal"] }
+tokio = { version = "1.52.1", features = [
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "signal",
+] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
