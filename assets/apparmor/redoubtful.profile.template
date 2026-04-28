@@ -1,0 +1,21 @@
+# AppArmor profile for redoubtful.
+#
+# Same shape Ubuntu ships for /etc/apparmor.d/{firefox,chrome,vscode,
+# flatpak,...}: a labeling-only profile attached to a specific binary
+# path. `flags=(unconfined)` means AppArmor doesn't enforce most rules
+# — the profile exists only to grant `userns,` to the named binary so
+# the kernel sysctl `apparmor_restrict_unprivileged_userns=1` allows
+# it to create a user namespace.
+#
+# This is not an ideal policy, but it's simple. And anything more
+# complex might not grant a ton of extra security on Ubuntu 24.04
+# without more work, thanks to how many other things already have a
+# similar profile.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile redoubtful {REDOUBTFUL_PATH} flags=(unconfined) {
+  userns,
+  include if exists <local/redoubtful>
+}

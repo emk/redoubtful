@@ -2,6 +2,19 @@
 #
 # These policies can be enforced using `cargo deny check`.
 
+# Constrain the audited dep graph to the targets we actually build for.
+# `redoubtful` is Linux-only (see ARCHITECTURE.md), so Windows-only sub-deps
+# of crates like `console` resolve into `Cargo.lock` but never compile —
+# without this, `cargo deny` would still audit them and we'd carry their
+# advisories/licenses for no reason.
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
 [advisories]
 ignore = []
 

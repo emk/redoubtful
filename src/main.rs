@@ -2,8 +2,8 @@
 
 mod argv;
 mod bwrap;
+mod check;
 mod cmd;
-mod deps;
 mod env;
 mod errors;
 mod forward;
@@ -27,6 +27,9 @@ struct Cli {
 /// Top-level `redoubtful` subcommands.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate that the host can run the sandbox.
+    Check(cmd::check::Args),
+
     /// Run a command inside the sandbox.
     Run(cmd::run::Args),
 
@@ -79,18 +82,10 @@ async fn run() -> Result<()> {
     debug!(?cli, "arguments");
 
     match cli.command {
-        Command::Run(args) => {
-            // `redoubtful run` actually launches the sandbox, so probe
-            // bwrap/pasta first and bail with a friendly error if they
-            // are missing.
-            let versions = deps::probe_required().await?;
-            debug!(
-                bwrap = %versions.bwrap,
-                pasta = %versions.pasta,
-                "external dependencies found",
-            );
-            cmd::run::cmd_run(args).await
-        }
+        // Preflight lives inside `cmd_run` itself so the same
+        // `print_report` path serves both `check` and `run`.
+        Command::Check(args) => cmd::check::cmd_check(args).await,
+        Command::Run(args) => cmd::run::cmd_run(args).await,
         // `redoubtful show` only inspects what we'd construct, so it
         // doesn't need bwrap/pasta to be installed.
         Command::Show(args) => cmd::show::cmd_show(args).await,

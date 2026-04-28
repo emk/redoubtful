@@ -149,6 +149,95 @@ struct EnvJson {
     source: String,
 }
 
+/// `cmd()` with a synthesized empty `$PATH` so bwrap and pasta
+/// cannot be located. Used by preflight tests that want to assert
+/// the failure-path report.
+fn cmd_empty_path() -> Command {
+    let dir = tempfile::tempdir().expect("tempdir for empty PATH");
+    // Leak the tempdir so its path stays valid for the entire test —
+    // the directory just needs to exist while assert_cmd runs the
+    // child. Cleanup is best-effort via the OS-tempdir reaper.
+    let path: PathBuf = dir.keep();
+    let mut c = cmd();
+    // NO_COLOR makes the report assertions stable regardless of
+    // whether the test runner is attached to a TTY.
+    c.env("PATH", path).env("NO_COLOR", "1");
+    c
+}
+
+#[test]
+fn check_on_healthy_host_passes() {
+    // The check report goes to stderr in both `check` and `run` —
+    // it's diagnostic output, not data, so stdout stays free for a
+    // future `--json` mode.
+    cmd()
+        .env("NO_COLOR", "1")
+        .arg("check")
+        .assert()
+        .success()
+        .stderr(contains("✅ bwrap").and(contains("All checks passed.")));
+}
+
+#[test]
+fn check_with_bwrap_missing_fails_and_skips_userns() {
+    let out = cmd_empty_path()
+        .arg("check")
+        .output()
+        .expect("check with empty PATH");
+    assert!(!out.status.success(), "expected failure: {out:?}");
+    let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
+    // The bwrap fail header reads "❌ `bwrap` not found on $PATH" —
+    // substring-match the bare binary name to avoid getting tangled
+    // up in the backticks in the error message.
+    assert!(stderr.contains("not found on $PATH"), "stderr: {stderr}");
+    // userns must be Skip (not Fail) when bwrap is missing —
+    // we shouldn't fake-fail a check whose prerequisite isn't met.
+    assert!(stderr.contains("➖"), "skip glyph absent: {stderr}");
+    assert!(
+        stderr.contains("bwrap to check"),
+        "userns skip absent: {stderr}"
+    );
+    assert!(stderr.contains("checks failed."), "stderr: {stderr}");
+}
+
+#[test]
+fn run_silent_on_preflight_success() {
+    let out = cmd()
+        .args(["run", "/bin/true"])
+        .output()
+        .expect("run /bin/true");
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
+    // The preflight report contains this exact header. If preflight
+    // passed we should not see it; pasta's own "No routable
+    // interface for IPv6" lines on stderr are fine to ignore.
+    assert!(
+        !stderr.contains("Checking redoubtful prerequisites"),
+        "preflight report should be silent on success; stderr: {stderr}",
+    );
+}
+
+#[test]
+fn run_emits_preflight_report_to_stderr_on_failure() {
+    let out = cmd_empty_path()
+        .args(["run", "/bin/true"])
+        .output()
+        .expect("run with empty PATH");
+    assert!(!out.status.success(), "expected run to fail: {out:?}");
+    let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
+    let stdout = std::str::from_utf8(&out.stdout).expect("utf-8");
+    // Preflight failure → the bwrap-missing header lands on stderr.
+    // The "❌" emoji is unique to the report so its presence proves
+    // preflight actually ran (vs. an empty stderr caused by some
+    // unrelated early-bail).
+    assert!(
+        stderr.contains("❌") && stderr.contains("not found on $PATH"),
+        "preflight report missing on stderr: stderr={stderr} stdout={stdout}",
+    );
+    // The user's command must not have run.
+    assert_eq!(stdout, "", "stdout should be empty: {stdout}");
+}
+
 #[test]
 fn version_flag_prints_package_version() {
     cmd()

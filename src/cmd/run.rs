@@ -27,6 +27,7 @@ use tokio::process::Command;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::bwrap::bwrap_argv;
+use crate::check::{any_failed, print_report_to_stderr, run_all_checks};
 use crate::env::{EnvList, EnvOpts};
 use crate::forward::{ForwardList, ForwardOpts};
 use crate::mounts::{MountList, MountOpts, current_dir, home_dir};
@@ -73,6 +74,17 @@ pub async fn cmd_run(args: Args) -> Result<()> {
         args,
     } = args;
     debug!(command, ?args, "executing command in sandbox");
+
+    // Preflight: verify bwrap/pasta are on PATH and user namespaces
+    // can be created. On failure, emit the same report `redoubtful
+    // check` would print (to stderr — this isn't the user's
+    // requested output) and exit before touching the sandbox setup.
+    // On success, stay silent: `redoubtful run` is the hot path.
+    let results = run_all_checks().await?;
+    if any_failed(&results) {
+        print_report_to_stderr(&results)?;
+        return Err(Error::exit("redoubtful run", 1));
+    }
 
     // Validate CLI mount sources up-front so we don't fail deep
     // inside bwrap setup with a less helpful diagnostic.

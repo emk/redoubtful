@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 capctl = "0.2.4"
 clap = { version = "4.6.1", features = ["derive"] }
+console = "0.16"
 libc = "0.2.186"
 miette = { version = "7.6.0", features = ["fancy"] }
 serde = { version = "1.0.228", features = ["derive"] }

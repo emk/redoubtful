@@ -49,16 +49,14 @@ pub enum Error {
         source: io::Error,
     },
 
-    /// Missing dependency.
-    #[error(
-        "`{command}` not found. Install the `{package}` package using your system package manager"
-    )]
+    /// Missing dependency. The message stays terse so the
+    /// preflight report's per-check remediation can vary
+    /// independently — see `check::probe_remediation`, which owns
+    /// the binary→package mapping for install instructions.
+    #[error("`{command}` not found on $PATH")]
     MissingDependency {
         /// The missing binary.
         command: String,
-
-        /// The package that provides the binary.
-        package: String,
     },
 
     /// Could not get a version string from a dependency.
@@ -81,6 +79,20 @@ pub enum Error {
     MissingEnvVar {
         /// The variable name.
         name: String,
+    },
+
+    /// Could not determine the path of the running `redoubtful` binary.
+    /// We need this to emit an AppArmor profile attached to the right
+    /// binary path; without it, any profile we printed would point at
+    /// the wrong file. A `current_exe()` failure is also a strong
+    /// signal that something is wrong with the host (deleted binary,
+    /// missing /proc, exotic execve path) — bail rather than try to
+    /// paper over it with a placeholder.
+    #[error("could not determine the path of the redoubtful binary")]
+    CouldNotGetCurrentExe {
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
     },
 
     /// Could not write to standard output.
@@ -135,13 +147,9 @@ impl Error {
     }
 
     /// Create an [`Error::MissingDependency`].
-    pub fn missing_dependency(
-        command: impl Into<String>,
-        package: impl Into<String>,
-    ) -> Self {
+    pub fn missing_dependency(command: impl Into<String>) -> Self {
         Self::MissingDependency {
             command: command.into(),
-            package: package.into(),
         }
     }
 
@@ -160,6 +168,11 @@ impl Error {
     /// Create an [`Error::MissingEnvVar`].
     pub fn missing_env_var(name: impl Into<String>) -> Self {
         Self::MissingEnvVar { name: name.into() }
+    }
+
+    /// Create an [`Error::CouldNotGetCurrentExe`].
+    pub fn could_not_get_current_exe(source: io::Error) -> Self {
+        Self::CouldNotGetCurrentExe { source }
     }
 
     /// Create an [`Error::CouldNotWriteStdout`].
