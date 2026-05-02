@@ -908,7 +908,7 @@ fn show_json_omits_unset_passthroughs() {
     }
 }
 
-// ===== Profiles (TOML config + `-p, --profile`) =====
+// ===== Profiles (TOML config + `-u, --uses`) =====
 //
 // Tests below isolate the profile-loading path from whatever real
 // `~/.config/redoubtful/config.toml` the developer has, by writing
@@ -936,7 +936,7 @@ fn cmd_with_config(toml: &str) -> Command {
 #[test]
 fn run_profile_unknown_errors_with_path() {
     let out = cmd_with_config("[profile.x]\n")
-        .args(["run", "-p", "does-not-exist", "/bin/true"])
+        .args(["run", "-u", "does-not-exist", "/bin/true"])
         .output()
         .expect("run with bad profile");
     assert!(!out.status.success(), "expected failure: {out:?}");
@@ -957,7 +957,7 @@ fn run_profile_unknown_errors_with_path() {
 fn run_profile_repeated_errors() {
     // Same profile twice on the CLI is a strict no-repeats error.
     let out = cmd_with_config("[profile.x]\n")
-        .args(["run", "-p", "x", "-p", "x", "/bin/true"])
+        .args(["run", "-u", "x", "-u", "x", "/bin/true"])
         .output()
         .expect("run with repeated profile");
     assert!(!out.status.success(), "expected failure: {out:?}");
@@ -970,7 +970,7 @@ fn run_profile_repeated_errors() {
 
 #[test]
 fn run_profile_diamond_via_uses_errors() {
-    // `a` and `b` both `uses = ["c"]`. Resolving `-p a -p b` would
+    // `a` and `b` both `uses = ["c"]`. Resolving `-u a -u b` would
     // visit `c` twice. Strict no-repeats rejects.
     let toml = r#"
 [profile.a]
@@ -980,7 +980,7 @@ uses = ["c"]
 [profile.c]
 "#;
     let out = cmd_with_config(toml)
-        .args(["run", "-p", "a", "-p", "b", "/bin/true"])
+        .args(["run", "-u", "a", "-u", "b", "/bin/true"])
         .output()
         .expect("run with diamond");
     assert!(!out.status.success(), "expected failure: {out:?}");
@@ -999,11 +999,11 @@ fn show_profile_emits_profile_mounts() {
     let toml = format!(
         r#"
 [profile.opencode]
-mount = [{{ host = "{host}/marker", sandbox = "/work/marker" }}]
+mounts = [{{ host = "{host}/marker", sandbox = "/work/marker" }}]
 "#,
     );
     let out = cmd_with_config(&toml)
-        .args(["show", "--json", "-p", "opencode"])
+        .args(["show", "--json", "-u", "opencode"])
         .output()
         .expect("show with profile");
     assert!(out.status.success(), "show failed: {out:?}");
@@ -1021,7 +1021,7 @@ fn run_profile_path_add_prepends_to_path() {
 path_add = ["/opt/profile/bin"]
 "#;
     cmd_with_config(toml)
-        .args(["run", "-p", "bin", "printenv", "PATH"])
+        .args(["run", "-u", "bin", "printenv", "PATH"])
         .assert()
         .success()
         .stdout(contains("/opt/profile/bin").and(contains("/usr/bin")));
@@ -1036,7 +1036,7 @@ env = [{ name = "MY_VAR" }]
 "#;
     cmd_with_config(toml)
         .env("MY_VAR", "yes-from-host")
-        .args(["run", "-p", "passthru", "printenv", "MY_VAR"])
+        .args(["run", "-u", "passthru", "printenv", "MY_VAR"])
         .assert()
         .success()
         .stdout(contains("yes-from-host"));
@@ -1049,7 +1049,7 @@ fn run_profile_env_literal_lands_in_sandbox() {
 env = [{ name = "FOO", value = "bar-from-profile" }]
 "#;
     cmd_with_config(toml)
-        .args(["run", "-p", "lit", "printenv", "FOO"])
+        .args(["run", "-u", "lit", "printenv", "FOO"])
         .assert()
         .success()
         .stdout(contains("bar-from-profile"));
@@ -1064,7 +1064,7 @@ fn run_cli_env_overrides_profile_env() {
 env = [{ name = "FOO", value = "from-profile" }]
 "#;
     cmd_with_config(toml)
-        .args(["run", "-p", "lit", "-e", "FOO=from-cli", "printenv", "FOO"])
+        .args(["run", "-u", "lit", "-e", "FOO=from-cli", "printenv", "FOO"])
         .assert()
         .success()
         .stdout(contains("from-cli"));
@@ -1077,7 +1077,7 @@ fn run_profile_bad_path_errors_with_friendly_message() {
 path_add = ["relative/dir"]
 "#;
     let out = cmd_with_config(toml)
-        .args(["run", "-p", "bad", "/bin/true"])
+        .args(["run", "-u", "bad", "/bin/true"])
         .output()
         .expect("run with bad path");
     assert!(!out.status.success(), "expected failure: {out:?}");

@@ -1,7 +1,7 @@
 //! The list of TCP port forwards from host loopback into the sandbox.
 //!
 //! Pipeline: the user declares forwards via [`ForwardDecls`] (`-f`
-//! from the CLI; the `forward = [...]` key in a `[profile.NAME]`
+//! from the CLI; the `forwards = [...]` key in a `[profile.NAME]`
 //! block from TOML). [`Decl::resolve`] turns one `ForwardDecls` into
 //! a [`Forwards`] (one [`Forward`] per declared spec). Multiple
 //! `Forwards` from layered profiles + CLI merge with
@@ -41,7 +41,7 @@ pub struct ForwardDecls {
         long = "forward",
         value_name = "HOST_PORT[:SANDBOX_PORT]"
     )]
-    pub forward: Vec<ForwardDecl>,
+    pub forwards: Vec<ForwardDecl>,
 }
 
 impl Decl for ForwardDecls {
@@ -49,7 +49,7 @@ impl Decl for ForwardDecls {
 
     /// Validate every [`ForwardDecl`] (port-zero rejection).
     fn validate(&self) -> Result<()> {
-        for spec in &self.forward {
+        for spec in &self.forwards {
             spec.validate()?;
         }
         Ok(())
@@ -57,7 +57,7 @@ impl Decl for ForwardDecls {
 
     fn resolve(&self) -> Result<Self::Resolved> {
         let forwards = self
-            .forward
+            .forwards
             .iter()
             .map(|d| d.resolve())
             .collect::<Result<Vec<_>>>()?;
@@ -194,7 +194,7 @@ mod tests {
         // the (empty) baseline underneath, so the user's entries
         // survive in declaration order.
         let decls = ForwardDecls {
-            forward: vec![
+            forwards: vec![
                 ForwardDecl {
                     host_port: Spanned::new(0..0, 8080),
                     sandbox_port: None,

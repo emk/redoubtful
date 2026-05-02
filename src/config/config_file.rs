@@ -301,9 +301,9 @@ mod tests {
         assert_eq!(cfg.profile_decls.len(), 1);
         let rust = cfg.profile_decls.get("rust").expect("rust profile present");
         assert!(rust.uses.is_empty());
-        assert!(rust.mount_decls.mount.is_empty());
+        assert!(rust.mount_decls.mounts.is_empty());
         assert!(rust.mount_decls.readonly.is_none());
-        assert!(rust.forward_decls.forward.is_empty());
+        assert!(rust.forward_decls.forwards.is_empty());
         assert!(rust.env_decls.env.is_empty());
         assert!(rust.env_decls.path.is_none());
         assert!(rust.env_decls.path_add.is_empty());
@@ -325,12 +325,12 @@ mod tests {
         let cfg = parse(
             r#"
 [profile.x]
-mount = [{ host = "/etc/gitconfig" }]
+mounts = [{ host = "/etc/gitconfig" }]
 "#,
         )
         .expect("parses");
         let x = cfg.profile_decls.get("x").expect("x");
-        let m = x.mount_decls.mount.first().expect("one mount");
+        let m = x.mount_decls.mounts.first().expect("one mount");
         assert_eq!(m.host.get_ref(), &PathBuf::from("/etc/gitconfig"));
         assert!(m.sandbox.is_none());
         assert_eq!(m.sandbox_path(), Path::new("/etc/gitconfig"));
@@ -342,7 +342,7 @@ mount = [{ host = "/etc/gitconfig" }]
         let cfg = parse(
             r#"
 [profile.x]
-mount = [{ host = "/h", sandbox = "/s", access = "rw" }]
+mounts = [{ host = "/h", sandbox = "/s", access = "rw" }]
 "#,
         )
         .expect("parses");
@@ -351,7 +351,7 @@ mount = [{ host = "/h", sandbox = "/s", access = "rw" }]
             .get("x")
             .expect("x")
             .mount_decls
-            .mount
+            .mounts
             .first()
             .expect("one mount");
         assert_eq!(m.host.get_ref(), &PathBuf::from("/h"));
@@ -364,7 +364,7 @@ mount = [{ host = "/h", sandbox = "/s", access = "rw" }]
         // `MountDecl` derives `Deserialize` with
         // `deny_unknown_fields`, so a typo like `host_path` instead
         // of `host` surfaces as a span at the bad key.
-        let source = "[profile.x]\nmount = [{ host_path = \"/x\" }]\n";
+        let source = "[profile.x]\nmounts = [{ host_path = \"/x\" }]\n";
         let err = parse(source).expect_err("bad field must error");
         let slice =
             span_slice(&err, source).expect("toml pinpoints unknown field");
@@ -376,14 +376,14 @@ mount = [{ host = "/h", sandbox = "/s", access = "rw" }]
 
     #[test]
     fn forward_short_form_defaults_sandbox_port() {
-        let cfg = parse("[profile.x]\nforward = [{ host_port = 8080 }]\n")
+        let cfg = parse("[profile.x]\nforwards = [{ host_port = 8080 }]\n")
             .expect("parses");
         let f = cfg
             .profile_decls
             .get("x")
             .expect("x")
             .forward_decls
-            .forward
+            .forwards
             .first()
             .expect("one forward");
         assert_eq!(*f.host_port.get_ref(), 8080);
@@ -496,7 +496,7 @@ mount = [{ host = "/h", sandbox = "/s", access = "rw" }]
         // a downstream validation error can render with miette
         // pointing at the offending line.
         let source = r#"[profile.x]
-mount = [{ host = "/etc/gitconfig" }]
+mounts = [{ host = "/etc/gitconfig" }]
 "#;
         let cfg = parse(source).expect("parses");
         let m = cfg
@@ -504,7 +504,7 @@ mount = [{ host = "/etc/gitconfig" }]
             .get("x")
             .expect("x")
             .mount_decls
-            .mount
+            .mounts
             .first()
             .expect("one mount");
         let span = m.host.span();

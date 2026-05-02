@@ -81,9 +81,7 @@ pub struct ProfileDecl {
     /// Names of other profiles this one transitively pulls in.
     /// Resolution is strict no-repeats: a profile reached via two
     /// `uses` paths is a config error, not a diamond to merge.
-    ///
-    /// TODO: Strongly consider whether this should be `--uses`.
-    #[arg(short = 'p', long = "profile", value_name = "NAME")]
+    #[arg(short = 'u', long = "uses", value_name = "NAME")]
     pub uses: Vec<String>,
 
     /// Mount entries (`mount = [...]`) and the `readonly` toggle.
@@ -120,11 +118,11 @@ impl<'de> Deserialize<'de> for ProfileDecl {
             #[serde(default)]
             uses: Vec<String>,
             #[serde(default)]
-            mount: Vec<MountDecl>,
+            mounts: Vec<MountDecl>,
             #[serde(default)]
             readonly: Option<bool>,
             #[serde(default)]
-            forward: Vec<ForwardDecl>,
+            forwards: Vec<ForwardDecl>,
             #[serde(default)]
             env: Vec<EnvVarDecl>,
             #[serde(default)]
@@ -141,11 +139,11 @@ impl<'de> Deserialize<'de> for ProfileDecl {
         Ok(ProfileDecl {
             uses: raw.uses,
             mount_decls: MountDecls {
-                mount: raw.mount,
+                mounts: raw.mounts,
                 readonly: raw.readonly,
             },
             forward_decls: ForwardDecls {
-                forward: raw.forward,
+                forwards: raw.forwards,
             },
             env_decls: EnvVarDecls {
                 env: raw.env,
@@ -319,7 +317,7 @@ mod tests {
         let decl = ProfileDecl {
             uses: Vec::new(),
             mount_decls: MountDecls {
-                mount: vec![MountDecl {
+                mounts: vec![MountDecl {
                     host: Spanned::new(0..0, PathBuf::from("/etc/gitconfig")),
                     sandbox: None,
                     access: None,
@@ -327,7 +325,7 @@ mod tests {
                 readonly: Some(true),
             },
             forward_decls: ForwardDecls {
-                forward: vec![ForwardDecl {
+                forwards: vec![ForwardDecl {
                     host_port: Spanned::new(0..0, 8080),
                     sandbox_port: None,
                 }],
@@ -369,7 +367,7 @@ mod tests {
         left_env.set("ONLY_LEFT", "L");
         let left = Profile {
             mounts: MountDecls {
-                mount: vec![MountDecl {
+                mounts: vec![MountDecl {
                     host: Spanned::new(0..0, PathBuf::from("/left")),
                     sandbox: None,
                     access: None,
@@ -379,7 +377,7 @@ mod tests {
             .resolve()
             .expect("resolves"),
             forwards: ForwardDecls {
-                forward: vec![ForwardDecl {
+                forwards: vec![ForwardDecl {
                     host_port: Spanned::new(0..0, 8080),
                     sandbox_port: None,
                 }],
@@ -394,7 +392,7 @@ mod tests {
         right_env.set("ONLY_RIGHT", "R");
         let right = Profile {
             mounts: MountDecls {
-                mount: vec![MountDecl {
+                mounts: vec![MountDecl {
                     host: Spanned::new(0..0, PathBuf::from("/right")),
                     sandbox: None,
                     access: None,
@@ -404,7 +402,7 @@ mod tests {
             .resolve()
             .expect("resolves"),
             forwards: ForwardDecls {
-                forward: vec![ForwardDecl {
+                forwards: vec![ForwardDecl {
                     host_port: Spanned::new(0..0, 9090),
                     sandbox_port: None,
                 }],
@@ -480,7 +478,7 @@ mod tests {
         // that has them, call clear_extra_fields, and confirm each
         // is zeroed. (Forwards has no extras.)
         let mounts = MountDecls {
-            mount: Vec::new(),
+            mounts: Vec::new(),
             readonly: Some(true),
         }
         .resolve()
@@ -549,7 +547,7 @@ mod tests {
         let decl = ProfileDecl {
             uses: Vec::new(),
             mount_decls: MountDecls {
-                mount: vec![MountDecl {
+                mounts: vec![MountDecl {
                     host: Spanned::new(0..0, PathBuf::from("/etc/gitconfig")),
                     sandbox: None,
                     access: None,

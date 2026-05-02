@@ -7,7 +7,7 @@
 //! can audit it without reconstructing what the bwrap argv means.
 //!
 //! Pipeline: the user declares mounts via [`MountDecls`] (`-m`,
-//! `--readonly` from the CLI; the `mount = [...]` and `readonly`
+//! `--readonly` from the CLI; the `mounts = [...]` and `readonly`
 //! keys in a `[profile.NAME]` block from TOML). [`Decl::resolve`]
 //! turns one `MountDecls` into a [`Mounts`] (one [`Mount`] per
 //! declared spec; the `readonly` toggle rides along as an extra
@@ -73,7 +73,7 @@ pub struct MountDecls {
         long = "mount",
         value_name = "HOST_PATH[:SANDBOX_PATH[:rw|:ro]]"
     )]
-    pub mount: Vec<MountDecl>,
+    pub mounts: Vec<MountDecl>,
 
     /// Mount the working directory read-only instead of read-write.
     /// Useful for exploratory agents that should be able to read the
@@ -101,7 +101,7 @@ pub struct MountDecls {
 impl NormalizeConfigPaths for MountDecls {
     /// Delegate to each [`MountDecl`]; `readonly` carries no path data.
     fn normalize_config_paths(&mut self, home: &Path) -> Result<()> {
-        for spec in &mut self.mount {
+        for spec in &mut self.mounts {
             spec.normalize_config_paths(home)?;
         }
         Ok(())
@@ -115,7 +115,7 @@ impl Decl for MountDecls {
     /// any are missing. Without this, the user gets bwrap's terser
     /// `Can't find source path` failure deep inside sandbox setup.
     fn validate(&self) -> Result<()> {
-        for spec in &self.mount {
+        for spec in &self.mounts {
             spec.validate()?;
         }
         Ok(())
@@ -123,7 +123,7 @@ impl Decl for MountDecls {
 
     fn resolve(&self) -> Result<Self::Resolved> {
         let mounts = self
-            .mount
+            .mounts
             .iter()
             .map(|d| d.resolve())
             .collect::<Result<Vec<_>>>()?;
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn normalize_config_paths_iterates_each_decl() {
         let mut decls = MountDecls {
-            mount: vec![
+            mounts: vec![
                 MountDecl {
                     host: Spanned::new(0..0, PathBuf::from("~/.gitconfig")),
                     sandbox: Some(Spanned::new(
@@ -637,16 +637,16 @@ mod tests {
             .normalize_config_paths(Path::new("/home/test"))
             .expect("normalizes");
         assert_eq!(
-            decls.mount[0].host.get_ref(),
+            decls.mounts[0].host.get_ref(),
             &PathBuf::from("/home/test/.gitconfig"),
         );
         assert_eq!(
-            decls.mount[0].sandbox.as_ref().unwrap().get_ref(),
+            decls.mounts[0].sandbox.as_ref().unwrap().get_ref(),
             &PathBuf::from("/home/test/.gitconfig"),
         );
         // Already-absolute paths pass through unchanged.
         assert_eq!(
-            decls.mount[1].host.get_ref(),
+            decls.mounts[1].host.get_ref(),
             &PathBuf::from("/etc/gitconfig"),
         );
     }
@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn decl_resolve_propagates_readonly() {
         let decls = MountDecls {
-            mount: vec![],
+            mounts: vec![],
             readonly: Some(true),
         };
         let resolved = decls.resolve().expect("resolves");
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn decl_resolve_yields_mount_per_decl() {
         let decls = MountDecls {
-            mount: vec![
+            mounts: vec![
                 MountDecl {
                     host: Spanned::new(0..0, PathBuf::from("/a")),
                     sandbox: None,

@@ -7,7 +7,7 @@
 #
 # Profiles are facets: each one bundles the equivalent of a few CLI
 # flags (-m, -e, -P, ...) under a name you can apply with
-# `redoubtful run -p NAME`. Multiple `-p` flags compose left-to-right
+# `redoubtful run -u NAME`. Multiple `-u` flags compose left-to-right
 # with last-wins on scalars (--readonly, --path) and append-in-order
 # on lists (-m, -e, -P). CLI flags layer on top of profiles.
 #
@@ -31,9 +31,9 @@
 #   redoubtful run -m ~/.opencode -m ~/.config/opencode \
 #                  -P ~/.opencode/bin opencode
 #
-# Apply with: `redoubtful run -p opencode opencode`.
+# Apply with: `redoubtful run -u opencode opencode`.
 [profile.opencode]
-mount = [
+mounts = [
     # Opencode's working state (sessions, history, downloaded
     # models). Mirrors README's `-m ~/.opencode`. Add `access =
     # "rw"` here if you want the sandboxed agent to be able to
