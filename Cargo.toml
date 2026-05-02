@@ -31,6 +31,7 @@ tokio = { version = "1.52.1", features = [
     "rt-multi-thread",
     "signal",
 ] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 

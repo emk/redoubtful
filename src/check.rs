@@ -9,10 +9,10 @@
 //! substituted in, ready to paste into `/etc/apparmor.d/redoubtful`.
 //! See `docs/APPARMOR_USERNS.md` for the broader story.
 
-use std::env;
-use std::fs;
-use std::io::{self, Write};
-use std::path::Path;
+use std::{
+    env, fs,
+    io::{self, Write},
+};
 
 use console::{StyledObject, style};
 use tokio::process::Command;
@@ -289,7 +289,14 @@ async fn check_userns(bwrap_ok: bool) -> Result<CheckResult> {
     let exe = exe
         .canonicalize()
         .map_err(Error::could_not_get_current_exe)?;
-    let remediation = build_userns_remediation(&exe);
+    // The AppArmor profile we render is configuration the user pastes
+    // into `apparmor_parser -r`, not diagnostic text — see
+    // `Error::NonUtf8ExePath` for why a lossy substitution would
+    // silently produce a profile attached to the wrong binary.
+    let exe_str = exe
+        .to_str()
+        .ok_or_else(|| Error::non_utf8_exe_path(exe.clone()))?;
+    let remediation = build_userns_remediation(exe_str);
     Ok(CheckResult {
         name: "userns",
         outcome: CheckOutcome::Fail {
@@ -329,9 +336,14 @@ async fn probe_bwrap_userns() -> bool {
 /// chunk so a user can mouse-select both with one drag and paste
 /// them in sequence — that's the whole reason `StyledDoc::Code`
 /// rendering is flush-left.
-fn build_userns_remediation(exe: &Path) -> StyledDoc {
-    let path = exe.to_string_lossy();
-    let mut profile = PROFILE_TEMPLATE.replace("{REDOUBTFUL_PATH}", &path);
+///
+/// `exe` is `&str` (not `&Path`): callers must validate UTF-8 before
+/// calling. The substituted path becomes part of an executable
+/// AppArmor profile, not user-facing diagnostic text — silently
+/// passing a lossy path through here would generate a profile
+/// attached to the wrong binary.
+fn build_userns_remediation(exe: &str) -> StyledDoc {
+    let mut profile = PROFILE_TEMPLATE.replace("{REDOUBTFUL_PATH}", exe);
     if !profile.ends_with('\n') {
         profile.push('\n');
     }
@@ -439,8 +451,6 @@ pub fn print_report(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
     #[tokio::test]
@@ -489,9 +499,7 @@ mod tests {
 
     #[test]
     fn build_userns_remediation_includes_path_and_commands() {
-        let doc = build_userns_remediation(&PathBuf::from(
-            "/home/test/.cargo/bin/redoubtful",
-        ));
+        let doc = build_userns_remediation("/home/test/.cargo/bin/redoubtful");
         let r = render(&doc);
         assert!(r.contains("/home/test/.cargo/bin/redoubtful"), "{r}");
         assert!(r.contains("sudo tee /etc/apparmor.d/redoubtful"), "{r}");

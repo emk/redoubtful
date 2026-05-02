@@ -20,21 +20,55 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use assert_cmd::Command;
 use predicates::{prelude::PredicateBooleanExt, str::contains};
-use tokio::io::AsyncWriteExt as _;
-use tokio::net::TcpListener;
+use tokio::{io::AsyncWriteExt as _, net::TcpListener};
+
+/// Per-process isolated `XDG_CONFIG_HOME` for the test suite,
+/// pre-populated with an empty `redoubtful/config.toml`.
+///
+/// Without this, every `redoubtful run`/`show` invocation triggered
+/// by the integration tests would cascade to `load_or_init`'s
+/// first-run dump path against the developer's real `$HOME`,
+/// writing the shipped default to `~/.config/redoubtful/config.toml`
+/// the first time anyone ran `cargo test`. Worse, the dump's
+/// stderr notice would land in the same buffer as real stderr
+/// assertions (`run_silent_on_preflight_success` etc.) and cause
+/// nondeterministic failures on the first vs. subsequent test runs.
+///
+/// The empty config short-circuits both side effects: an existing
+/// (zero-byte) file means "no profiles defined", `load_or_init`
+/// reads it without writing anything, and stderr stays clean.
+/// `OnceLock<TempDir>` keeps the dir alive for the entire test
+/// process; the OS reaps it at exit via TempDir's `Drop`.
+fn shared_xdg_config_home() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+
+    use tempfile::TempDir;
+    static DIR: OnceLock<TempDir> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let d = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
+        let cfg_dir = d.path().join("redoubtful");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir redoubtful");
+        std::fs::write(cfg_dir.join("config.toml"), "")
+            .expect("write empty config");
+        d
+    });
+    dir.path()
+}
 
 /// Our CLI command. Sandbox runs typically complete in well under
 /// a second on a developer laptop; the 30s timeout is a CI-hang
 /// circuit-breaker, not a steady-state expectation.
+///
+/// `XDG_CONFIG_HOME` is overridden to the shared per-process
+/// tempdir so the test never touches the developer's real config.
 fn cmd() -> Command {
     let mut c = Command::cargo_bin("redoubtful").expect("binary exists");
     c.timeout(Duration::from_secs(30));
+    c.env("XDG_CONFIG_HOME", shared_xdg_config_home());
     c
 }
 
@@ -44,11 +78,12 @@ fn cmd() -> Command {
 /// notably real `*_API_KEY` values, which would defeat the leak
 /// tests.
 ///
-/// We re-set just the two host vars `redoubtful` itself needs:
-/// `HOME` (consumed by `home_dir()` during sandbox setup) and `PATH`
+/// We re-set just the host vars `redoubtful` itself needs:
+/// `HOME` (consumed by `home_dir()` during sandbox setup), `PATH`
 /// (so the test process's `redoubtful` invocation can find `pasta`
-/// and `bwrap`). Everything else stays empty until tests opt in via
-/// `.env(...)`.
+/// and `bwrap`), and `XDG_CONFIG_HOME` (the shared isolated config
+/// dir — see [`shared_xdg_config_home`] for why). Everything else
+/// stays empty until tests opt in via `.env(...)`.
 fn cmd_clean() -> Command {
     let mut c = cmd();
     c.env_clear();
@@ -56,6 +91,7 @@ fn cmd_clean() -> Command {
     let path = std::env::var_os("PATH").expect("test process needs PATH");
     c.env("HOME", home);
     c.env("PATH", path);
+    c.env("XDG_CONFIG_HOME", shared_xdg_config_home());
     c
 }
 
@@ -146,7 +182,6 @@ struct ForwardJson {
 struct EnvJson {
     name: String,
     value: String,
-    source: String,
 }
 
 /// `cmd()` with a synthesized empty `$PATH` so bwrap and pasta
@@ -268,6 +303,32 @@ fn run_executes_the_given_command() {
 #[test]
 fn run_propagates_child_exit_code() {
     cmd().args(["run", "sh", "-c", "exit 42"]).assert().code(42);
+}
+
+#[test]
+fn run_preserves_non_utf8_argv_bytes() {
+    // Stray 0xff byte: invalid UTF-8 at any code unit boundary, so
+    // any layer that called `to_string_lossy` on the argv would
+    // replace it with U+FFFD (`\xef\xbf\xbd`) and the assertion
+    // below would fail. The sandboxed `printf '%s' <arg>` echoes
+    // the arg byte-for-byte to stdout, which `assert_cmd` exposes
+    // as raw bytes — letting us verify the argv survived clap →
+    // our types → bwrap argv → `execve` without a lossy hop.
+    use std::os::unix::ffi::OsStringExt as _;
+    let bytes: &[u8] = b"prefix-\xff-suffix";
+    let arg = std::ffi::OsString::from_vec(bytes.to_vec());
+    let out = cmd()
+        .arg("run")
+        .arg("/usr/bin/printf")
+        .arg("%s")
+        .arg(&arg)
+        .output()
+        .expect("run printf with non-UTF-8 arg");
+    assert!(out.status.success(), "run failed: {out:?}");
+    assert_eq!(
+        out.stdout, bytes,
+        "non-UTF-8 argv bytes did not survive into the sandbox",
+    );
 }
 
 #[test]
@@ -546,10 +607,6 @@ fn show_json_includes_cli_mounts() {
     assert!(out.status.success(), "show --json failed: {out:?}");
     let stdout = std::str::from_utf8(&out.stdout).expect("utf-8");
     assert!(
-        stdout.contains(r#""source": "cli""#),
-        "expected a cli-source mount entry; got:\n{stdout}",
-    );
-    assert!(
         stdout.contains("/work/marker"),
         "expected the sandbox path /work/marker to appear; got:\n{stdout}",
     );
@@ -708,7 +765,7 @@ fn run_path_add_prepends_to_canonical() {
     // so unqualified `printenv` still resolves) and the added
     // directory, with the addition appearing first.
     let out = cmd_clean()
-        .args(["run", "-p", "/opt/agent/bin", "printenv", "PATH"])
+        .args(["run", "-P", "/opt/agent/bin", "printenv", "PATH"])
         .output()
         .expect("run");
     assert!(out.status.success(), "run failed: {out:?}");
@@ -733,17 +790,19 @@ fn run_path_add_prepends_to_canonical() {
 }
 
 #[test]
-fn run_path_add_repeatable_prepends_in_order() {
-    // Multiple `-p` flags prepend in CLI order: `-p /a -p /b` →
-    // `/a:/b:<canonical>`. Same convention as `fish_add_path /a /b`.
+fn run_path_add_repeatable_prepends_in_reverse_order() {
+    // Multiple `-P` flags prepend in *reverse* CLI order so a later
+    // flag wins (matches `export PATH=$DIR:$PATH` and the
+    // "later overrides earlier" CLI convention): `-P /a -P /b` →
+    // `/b:/a:<canonical>`.
     cmd_clean()
         .args([
-            "run", "-p", "/first/bin", "-p", "/second/bin", "printenv", "PATH",
+            "run", "-P", "/first/bin", "-P", "/second/bin", "printenv", "PATH",
         ])
         .assert()
         .success()
         .stdout(contains(
-            "/first/bin:/second/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "/second/bin:/first/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         ));
 }
 
@@ -756,7 +815,7 @@ fn run_path_add_prepends_to_path_override() {
             "run",
             "--path",
             "/only/this",
-            "-p",
+            "-P",
             "/extra",
             "/usr/bin/printenv",
             "PATH",
@@ -810,18 +869,15 @@ fn show_json_includes_env() {
         path.value,
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     );
-    assert_eq!(path.source, "default");
 
     let home = by_name("HOME").expect("HOME entry present");
     assert_eq!(
         home.value,
         std::env::var("HOME").expect("test process needs HOME"),
     );
-    assert_eq!(home.source, "default");
 
     let term = by_name("TERM").expect("TERM entry present (passthrough)");
     assert_eq!(term.value, "xterm-256color");
-    assert_eq!(term.source, "default");
 }
 
 #[test]
@@ -850,4 +906,281 @@ fn show_json_omits_unset_passthroughs() {
              got names: {names:?}",
         );
     }
+}
+
+// ===== Profiles (TOML config + `-p, --profile`) =====
+//
+// Tests below isolate the profile-loading path from whatever real
+// `~/.config/redoubtful/config.toml` the developer has, by writing
+// a fixture into a tempdir and pointing `XDG_CONFIG_HOME` at it.
+// The binary's `config_path()` honors `XDG_CONFIG_HOME`, so a fresh
+// tempdir gives each test its own config namespace.
+
+/// A `cmd_clean()` whose `XDG_CONFIG_HOME` points at a fresh
+/// tempdir containing `redoubtful/config.toml = <toml>`. Each test
+/// gets its own dir; the tempdir is leaked because cleanup races
+/// with `assert_cmd` running the child process (best-effort cleanup
+/// happens via the OS tempdir reaper).
+fn cmd_with_config(toml: &str) -> Command {
+    let dir = tempfile::tempdir().expect("tempdir for profile config");
+    let config_dir = dir.path().join("redoubtful");
+    std::fs::create_dir(&config_dir).expect("create redoubtful subdir");
+    std::fs::write(config_dir.join("config.toml"), toml)
+        .expect("write profile fixture");
+    let path: PathBuf = dir.keep();
+    let mut c = cmd_clean();
+    c.env("XDG_CONFIG_HOME", path);
+    c
+}
+
+#[test]
+fn run_profile_unknown_errors_with_path() {
+    let out = cmd_with_config("[profile.x]\n")
+        .args(["run", "-p", "does-not-exist", "/bin/true"])
+        .output()
+        .expect("run with bad profile");
+    assert!(!out.status.success(), "expected failure: {out:?}");
+    let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("unknown profile") && stderr.contains("does-not-exist"),
+        "stderr should name the unknown profile: {stderr}",
+    );
+    // The diagnostic should include the config path so the user
+    // knows where to add the profile.
+    assert!(
+        stderr.contains("config.toml"),
+        "stderr should mention the config file: {stderr}",
+    );
+}
+
+#[test]
+fn run_profile_repeated_errors() {
+    // Same profile twice on the CLI is a strict no-repeats error.
+    let out = cmd_with_config("[profile.x]\n")
+        .args(["run", "-p", "x", "-p", "x", "/bin/true"])
+        .output()
+        .expect("run with repeated profile");
+    assert!(!out.status.success(), "expected failure: {out:?}");
+    let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("already included") && stderr.contains("`x`"),
+        "stderr should flag the repeated profile: {stderr}",
+    );
+}
+
+#[test]
+fn run_profile_diamond_via_uses_errors() {
+    // `a` and `b` both `uses = ["c"]`. Resolving `-p a -p b` would
+    // visit `c` twice. Strict no-repeats rejects.
+    let toml = r#"
+[profile.a]
+uses = ["c"]
+[profile.b]
+uses = ["c"]
+[profile.c]
+"#;
+    let out = cmd_with_config(toml)
+        .args(["run", "-p", "a", "-p", "b", "/bin/true"])
+        .output()
+        .expect("run with diamond");
+    assert!(!out.status.success(), "expected failure: {out:?}");
+    let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("already included") && stderr.contains("`c`"),
+        "stderr should flag the diamond: {stderr}",
+    );
+}
+
+#[test]
+fn show_profile_emits_profile_mounts() {
+    let dir = tempfile::tempdir().expect("tempdir for mount target");
+    std::fs::write(dir.path().join("marker"), b"x").expect("write");
+    let host = dir.path().to_str().expect("utf-8");
+    let toml = format!(
+        r#"
+[profile.opencode]
+mount = [{{ host = "{host}/marker", sandbox = "/work/marker" }}]
+"#,
+    );
+    let out = cmd_with_config(&toml)
+        .args(["show", "--json", "-p", "opencode"])
+        .output()
+        .expect("show with profile");
+    assert!(out.status.success(), "show failed: {out:?}");
+    let stdout = std::str::from_utf8(&out.stdout).expect("utf-8");
+    assert!(
+        stdout.contains("/work/marker"),
+        "sandbox path absent: {stdout}",
+    );
+}
+
+#[test]
+fn run_profile_path_add_prepends_to_path() {
+    let toml = r#"
+[profile.bin]
+path_add = ["/opt/profile/bin"]
+"#;
+    cmd_with_config(toml)
+        .args(["run", "-p", "bin", "printenv", "PATH"])
+        .assert()
+        .success()
+        .stdout(contains("/opt/profile/bin").and(contains("/usr/bin")));
+}
+
+#[test]
+fn run_profile_env_passthrough_resolves_against_host() {
+    // Profile asks to pass `MY_VAR` through. Test process sets it.
+    let toml = r#"
+[profile.passthru]
+env = [{ name = "MY_VAR" }]
+"#;
+    cmd_with_config(toml)
+        .env("MY_VAR", "yes-from-host")
+        .args(["run", "-p", "passthru", "printenv", "MY_VAR"])
+        .assert()
+        .success()
+        .stdout(contains("yes-from-host"));
+}
+
+#[test]
+fn run_profile_env_literal_lands_in_sandbox() {
+    let toml = r#"
+[profile.lit]
+env = [{ name = "FOO", value = "bar-from-profile" }]
+"#;
+    cmd_with_config(toml)
+        .args(["run", "-p", "lit", "printenv", "FOO"])
+        .assert()
+        .success()
+        .stdout(contains("bar-from-profile"));
+}
+
+#[test]
+fn run_cli_env_overrides_profile_env() {
+    // Profile sets FOO=from-profile; CLI -e overrides to FOO=from-cli.
+    // CLI applies last, so CLI wins.
+    let toml = r#"
+[profile.lit]
+env = [{ name = "FOO", value = "from-profile" }]
+"#;
+    cmd_with_config(toml)
+        .args(["run", "-p", "lit", "-e", "FOO=from-cli", "printenv", "FOO"])
+        .assert()
+        .success()
+        .stdout(contains("from-cli"));
+}
+
+#[test]
+fn run_profile_bad_path_errors_with_friendly_message() {
+    let toml = r#"
+[profile.bad]
+path_add = ["relative/dir"]
+"#;
+    let out = cmd_with_config(toml)
+        .args(["run", "-p", "bad", "/bin/true"])
+        .output()
+        .expect("run with bad path");
+    assert!(!out.status.success(), "expected failure: {out:?}");
+    let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("relative paths are not supported"),
+        "stderr should explain: {stderr}",
+    );
+}
+
+#[test]
+fn run_no_profile_silently_ignores_missing_config() {
+    // No -p, no config file at the XDG path → behaves exactly as
+    // before (a missing config is "no profiles defined").
+    let dir = tempfile::tempdir().expect("tempdir for empty xdg");
+    let path: PathBuf = dir.keep();
+    cmd_clean()
+        .env("XDG_CONFIG_HOME", path)
+        .args(["run", "echo", "hello"])
+        .assert()
+        .success()
+        .stdout(contains("hello"));
+}
+
+#[test]
+fn run_with_broken_config_surfaces_error_even_without_profile_arg() {
+    // A broken config should fail loudly even when no -p is passed
+    // — better that the user finds out the moment they introduce
+    // the syntax error than the next time they happen to use a
+    // profile.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_dir = dir.path().join("redoubtful");
+    std::fs::create_dir(&config_dir).expect("create dir");
+    std::fs::write(config_dir.join("config.toml"), "= 1\n")
+        .expect("write broken fixture");
+    let path: PathBuf = dir.keep();
+    let out = cmd_clean()
+        .env("XDG_CONFIG_HOME", path)
+        .args(["run", "/bin/true"])
+        .output()
+        .expect("run with broken config");
+    assert!(!out.status.success(), "expected failure: {out:?}");
+    let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("invalid config"),
+        "stderr should call out invalid config: {stderr}",
+    );
+}
+
+#[test]
+fn first_run_writes_default_config() {
+    // Brand-new XDG_CONFIG_HOME with no redoubtful/ subdir at all
+    // — `load_or_init` should mkdir-p and drop the embedded default
+    // in place.
+    let dir = tempfile::tempdir().expect("tempdir for first run");
+    let xdg = dir.path().to_path_buf();
+    let cfg_path = xdg.join("redoubtful").join("config.toml");
+    let leak: PathBuf = dir.keep();
+
+    let out = cmd_clean()
+        .env("XDG_CONFIG_HOME", &leak)
+        .args(["run", "/bin/true"])
+        .output()
+        .expect("first run");
+    assert!(out.status.success(), "first run failed: {out:?}");
+
+    let on_disk =
+        std::fs::read_to_string(&cfg_path).expect("config file written");
+    assert!(
+        on_disk.contains("[profile.opencode]"),
+        "shipped default must include [profile.opencode]: {on_disk}",
+    );
+}
+
+#[test]
+fn second_run_does_not_re_emit_first_run_notice() {
+    // After the file exists, subsequent runs hit the read path and
+    // stay silent. If the second run *did* re-init, it'd be a UX
+    // bug (and probably a sign of a Drop-related cleanup race).
+    let dir = tempfile::tempdir().expect("tempdir for second run");
+    let leak: PathBuf = dir.keep();
+
+    // First run: triggers init + notice (we don't assert on it
+    // here; the previous test covers that).
+    let _ = cmd_clean()
+        .env("XDG_CONFIG_HOME", &leak)
+        .args(["run", "/bin/true"])
+        .output()
+        .expect("first run");
+
+    // Second run: stderr should NOT contain the notice. (Other
+    // stderr — pasta tap-init lines, the preflight report on a
+    // failure — is fine; we only assert against the dump-notice
+    // substring.)
+    let out = cmd_clean()
+        .env("XDG_CONFIG_HOME", &leak)
+        .args(["run", "/bin/true"])
+        .output()
+        .expect("second run");
+    assert!(out.status.success(), "second run failed: {out:?}");
+    let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
+    assert!(
+        !stderr.contains("wrote default config to"),
+        "second run must not re-emit init notice: {stderr}",
+    );
 }

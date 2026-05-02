@@ -1,6 +1,6 @@
 //! Build the bwrap command line for `redoubtful run`.
 //!
-//! Translates the mount inventory (see [`crate::mounts`]) into the
+//! Translates the mount inventory (see [`crate::config::mounts`]) into the
 //! corresponding bwrap argv, prepends our namespace + security
 //! flags, and appends the user command. The mount inventory is the
 //! security-critical inventory; this file is just glue plus the
@@ -23,24 +23,31 @@
 //! This file favors "comment overkill", in order to preserve security
 //! justifications and original reference information for our decisions.
 
-use std::ffi::OsString;
-use std::path::Path;
+use std::{
+    ffi::{OsStr, OsString},
+    path::Path,
+};
 
-use crate::argv::ArgvBuilder;
-use crate::env::EnvList;
-use crate::mounts::{MountAccess, MountKind, MountList};
-use crate::prelude::*;
+use crate::{
+    argv::ArgvBuilder,
+    config::{
+        env_vars::EnvVars,
+        mount::{MountAccess, MountKind},
+        mounts::Mounts,
+    },
+    prelude::*,
+};
 
 /// Build the full argv for `bwrap` (not including `bwrap` itself),
 /// ending with `-- <command> <args...>`.
 #[instrument(level = "debug", skip_all,
-    fields(command, n_mounts = mounts.len(), n_env = env.len()))]
+    fields(?command, n_mounts = mounts.len(), n_env = env.len()))]
 pub fn bwrap_argv(
-    mounts: &MountList,
-    env: &EnvList,
+    mounts: &Mounts,
+    env: &EnvVars,
     cwd: &Path,
-    command: &str,
-    args: &[String],
+    command: &OsStr,
+    args: &[OsString],
 ) -> Vec<OsString> {
     let mut a = ArgvBuilder::default();
 
@@ -113,9 +120,10 @@ pub fn bwrap_argv(
     // ANTHROPIC_API_KEY, GITHUB_TOKEN, SSH_AUTH_SOCK, etc. survives
     // unless the user typed it on the command line.
     //
-    // The `EnvList` is already resolved at this point — passthroughs
-    // were materialized against `std::env::var` when the list was
-    // built (see `crate::env`), so this layer is a straight
+    // The `EnvVars` inventory is already resolved at this point —
+    // passthroughs were materialized against `std::env::var_os` at
+    // construction (see [`crate::config::env_vars`]), so this layer
+    // is a straight
     // translation with no host-env reads of its own. That keeps the
     // mapping from inventory to argv mechanical and auditable, and
     // means `redoubtful show --json` produces exactly the same
@@ -127,12 +135,12 @@ pub fn bwrap_argv(
     //   the sandbox" + "The bwrap invocation".
     a.flag("--clearenv");
     for entry in env.iter() {
-        a.triple_str("--setenv", &entry.name, &entry.value);
+        a.triple_str_os("--setenv", &entry.name, &entry.value);
     }
 
     // ===== Mount inventory =====
     //
-    // Translated 1:1 from the inventory (see `crate::mounts`). All
+    // Translated 1:1 from the inventory (see `crate::config::mounts`). All
     // semantic decisions live there with auditability comments.
     for m in mounts.iter() {
         match &m.kind {
@@ -155,7 +163,7 @@ pub fn bwrap_argv(
     // ===== Working directory and command =====
     a.single_path("--chdir", cwd);
     a.flag("--");
-    a.flag(command);
+    a.arg_os(command);
     a.extend_args(args);
     let argv = a.into_vec();
 
@@ -170,7 +178,10 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
-    use crate::mounts::MountAccess;
+    use crate::{
+        config::{Finalize, profile::Profile},
+        dirs::current_dir,
+    };
 
     fn os(s: &str) -> OsString {
         OsString::from(s)
@@ -188,44 +199,37 @@ mod tests {
         Some((argv.get(one)?.clone(), argv.get(two)?.clone()))
     }
 
+    /// Build the default `Mounts` + `EnvVars` baseline for tests via
+    /// the production `Decl` + `Finalize` pipeline. Reads the live
+    /// `$HOME` and current directory the way `cmd_run` does, so the
+    /// resulting cwd-bind path is whatever `current_dir()` returns
+    /// in the test runner.
+    fn baseline_for_test() -> (Mounts, EnvVars, std::path::PathBuf) {
+        let profile = Profile::default().finalize();
+        let cwd = current_dir().expect("test runner has a working cwd");
+        (profile.mounts, profile.env, cwd)
+    }
+
     #[test]
     fn argv_starts_with_unshare_all_share_net() {
-        let mounts = MountList::default_baseline(
-            Path::new("/home/u"),
-            Path::new("/home/u/proj"),
-            MountAccess::Rw,
-        );
-        let env = EnvList::default_baseline(Path::new("/home/u"), None, &[]);
-        let argv =
-            bwrap_argv(&mounts, &env, Path::new("/home/u/proj"), "true", &[]);
+        let (mounts, env, cwd) = baseline_for_test();
+        let argv = bwrap_argv(&mounts, &env, &cwd, OsStr::new("true"), &[]);
         assert_eq!(argv.first(), Some(&os("--unshare-all")));
         assert_eq!(argv.get(1), Some(&os("--share-net")));
     }
 
     #[test]
     fn argv_includes_die_with_parent_and_new_session() {
-        let mounts = MountList::default_baseline(
-            Path::new("/home/u"),
-            Path::new("/home/u/proj"),
-            MountAccess::Rw,
-        );
-        let env = EnvList::default_baseline(Path::new("/home/u"), None, &[]);
-        let argv =
-            bwrap_argv(&mounts, &env, Path::new("/home/u/proj"), "true", &[]);
+        let (mounts, env, cwd) = baseline_for_test();
+        let argv = bwrap_argv(&mounts, &env, &cwd, OsStr::new("true"), &[]);
         assert!(argv.contains(&os("--die-with-parent")));
         assert!(argv.contains(&os("--new-session")));
     }
 
     #[test]
     fn argv_translates_default_mounts() {
-        let mounts = MountList::default_baseline(
-            Path::new("/home/u"),
-            Path::new("/home/u/proj"),
-            MountAccess::Rw,
-        );
-        let env = EnvList::default_baseline(Path::new("/home/u"), None, &[]);
-        let argv =
-            bwrap_argv(&mounts, &env, Path::new("/home/u/proj"), "true", &[]);
+        let (mounts, env, cwd) = baseline_for_test();
+        let argv = bwrap_argv(&mounts, &env, &cwd, OsStr::new("true"), &[]);
         assert_eq!(
             find_pair(&argv, "--ro-bind"),
             Some((os("/usr"), os("/usr"))),
@@ -234,10 +238,10 @@ mod tests {
             find_pair(&argv, "--symlink"),
             Some((os("usr/bin"), os("/bin"))),
         );
-        assert_eq!(
-            find_pair(&argv, "--bind"),
-            Some((os("/home/u/proj"), os("/home/u/proj"))),
-        );
+        // The cwd bind is the live `current_dir()`. Same path on both
+        // sides — bwrap sees `<cwd> <cwd>`.
+        let cwd_os: OsString = cwd.clone().into_os_string();
+        assert_eq!(find_pair(&argv, "--bind"), Some((cwd_os.clone(), cwd_os)),);
     }
 
     #[test]
@@ -247,15 +251,10 @@ mod tests {
         // bwrap manpage says the setenv is undone when clearenv
         // runs. (See `man bwrap`: "These options change in the
         // order they are given.")
-        let mounts = MountList::default_baseline(
-            Path::new("/home/u"),
-            Path::new("/home/u/proj"),
-            MountAccess::Rw,
-        );
-        let mut env = EnvList::new();
-        env.set("FOO", "bar".to_owned(), crate::env::EnvSource::Default);
-        let argv =
-            bwrap_argv(&mounts, &env, Path::new("/home/u/proj"), "true", &[]);
+        let (mounts, _, cwd) = baseline_for_test();
+        let mut env = EnvVars::default();
+        env.set("FOO", "bar".to_owned());
+        let argv = bwrap_argv(&mounts, &env, &cwd, OsStr::new("true"), &[]);
         let clear_idx = argv
             .iter()
             .position(|a| a.as_os_str() == OsStr::new("--clearenv"))
@@ -272,19 +271,14 @@ mod tests {
 
     #[test]
     fn argv_emits_setenv_per_entry_in_order() {
-        // The translation from EnvList to argv is a straight
+        // The translation from EnvVars to argv is a straight
         // 1:1 emit; verify that two entries produce two
         // --setenv NAME VALUE triples in order.
-        let mounts = MountList::default_baseline(
-            Path::new("/home/u"),
-            Path::new("/home/u/proj"),
-            MountAccess::Rw,
-        );
-        let mut env = EnvList::new();
-        env.set("ALPHA", "1".to_owned(), crate::env::EnvSource::Default);
-        env.set("BETA", "2".to_owned(), crate::env::EnvSource::Default);
-        let argv =
-            bwrap_argv(&mounts, &env, Path::new("/home/u/proj"), "true", &[]);
+        let (mounts, _, cwd) = baseline_for_test();
+        let mut env = EnvVars::default();
+        env.set("ALPHA", "1".to_owned());
+        env.set("BETA", "2".to_owned());
+        let argv = bwrap_argv(&mounts, &env, &cwd, OsStr::new("true"), &[]);
         // Find the first --setenv occurrence; the next two args
         // are name+value, then another --setenv with the next pair.
         let first = argv
@@ -300,18 +294,13 @@ mod tests {
 
     #[test]
     fn command_and_args_appear_after_double_dash() {
-        let mounts = MountList::default_baseline(
-            Path::new("/home/u"),
-            Path::new("/home/u/proj"),
-            MountAccess::Rw,
-        );
-        let env = EnvList::default_baseline(Path::new("/home/u"), None, &[]);
+        let (mounts, env, cwd) = baseline_for_test();
         let argv = bwrap_argv(
             &mounts,
             &env,
-            Path::new("/home/u/proj"),
-            "echo",
-            &["hello".to_string(), "world".to_string()],
+            &cwd,
+            OsStr::new("echo"),
+            &[OsString::from("hello"), OsString::from("world")],
         );
         let dash = argv
             .iter()

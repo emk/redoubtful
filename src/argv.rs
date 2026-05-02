@@ -19,8 +19,10 @@
 //!   pasta(1) manpage:
 //!     <https://passt.top/builds/latest/web/passt.1.html>
 
-use std::ffi::OsString;
-use std::path::Path;
+use std::{
+    ffi::{OsStr, OsString},
+    path::Path,
+};
 
 /// Internal accumulator of `OsString` argv tokens.
 ///
@@ -67,15 +69,15 @@ impl ArgvBuilder {
         self.argv.push(OsString::from(value));
     }
 
-    /// Append `flag` followed by two string operands
-    /// (e.g. `--setenv PATH /usr/bin`). Bwrap's `--setenv` takes the
-    /// name and value as separate argv tokens, so a 2-string pair
-    /// helper avoids reconstructing `OsString` boilerplate at the
-    /// call site.
-    pub fn triple_str(&mut self, flag: &str, a: &str, b: &str) {
+    /// Append `flag`, a string operand, and an `&OsStr` operand
+    /// (e.g. `--setenv NAME VALUE`). Bwrap's `--setenv` takes the
+    /// name and value as separate argv tokens, and the value is an
+    /// [`crate::config::env_var::EnvVar::value`] (`OsString`) that
+    /// may carry non-UTF-8 host bytes verbatim.
+    pub fn triple_str_os(&mut self, flag: &str, a: &str, b: &OsStr) {
         self.argv.push(OsString::from(flag));
         self.argv.push(OsString::from(a));
-        self.argv.push(OsString::from(b));
+        self.argv.push(b.to_owned());
     }
 
     /// Append a sequence of pre-built `OsString` tokens verbatim.
@@ -85,13 +87,19 @@ impl ArgvBuilder {
         self.argv.extend(tokens);
     }
 
-    /// Append a slice of `String` arguments verbatim. Used for the
+    /// Append a single `&OsStr` argument verbatim. Used for the
+    /// user-supplied command token (the binary name to exec inside
+    /// the sandbox), which arrives from clap as an `OsString` and
+    /// must reach `execve` byte-for-byte.
+    pub fn arg_os(&mut self, s: &OsStr) {
+        self.argv.push(s.to_owned());
+    }
+
+    /// Append a slice of `OsString` arguments verbatim. Used for the
     /// user command's CLI arguments, which arrive from clap as
-    /// `Vec<String>`.
-    pub fn extend_args(&mut self, args: &[String]) {
-        for a in args {
-            self.argv.push(OsString::from(a));
-        }
+    /// `Vec<OsString>` so non-UTF-8 host bytes survive end-to-end.
+    pub fn extend_args(&mut self, args: &[OsString]) {
+        self.argv.extend(args.iter().cloned());
     }
 
     /// Consume the builder and return the assembled argv.

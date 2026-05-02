@@ -1,5 +1,7 @@
 # redoubtful: Simple Linux agent sandbox
 
+**PROJECT STATUS:** Initial development, iterating heavily to improve ergonomics. Breaking changes are fair game.
+
 ## Layout
 
 - `docs/`: Permanent reference docs, in Markdown.
@@ -8,6 +10,7 @@
 - `plans/`: More emphemeral planning docs, in Markdown. Must have a "> **Status:**" line under the title.
 - `src/`:
     - `cmd/`: Command-line interface.
+    - `config/`: Config file handing and share CLI argument types.
     - `prelude.rs`: Key imports used everywhere.
 - `tests/`: Integration tests for the CLI interface.
     - `cli.rs`: Main integration test binary.
@@ -55,9 +58,20 @@ The most common definitions, including error-handling and logging, are available
 
 All public items must be documented.
 
+### String vs OsString, and "lossy" conversion functions
+
+This program frequently manipulates paths and environment variables, which can be losslessly-represented using Path, Pathbuf, OsStr and OsString. The rules are:
+
+- It is only acceptable to silently loose non-UTF8 data in user-facing diagnostic output.
+- If we cannot preserve non-UTF-8 data on other code paths, it is better to error cleanly.
+- Our configuration files are UTF-8 only, and this is OK.
+- It is fine to support OsString in CLI arguments, environment variables, etc., if this does not add too much complexity.
+
+The overall principle is that non-UTF-8 data is a reality, and we would prefer to handle it correctly. But there may be edge cases (like config files) where this is poorly-supported, and that's OK.
+
 ### Unsafe Code
 
-Unsafe code is forbidden.
+Unsafe code is forbidden, except cases where we need to bind operating-system-specific APIs for correctness.
 
 ### Arithmetic and Numeric Conversionsg 
 

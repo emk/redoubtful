@@ -1,0 +1,49 @@
+# redoubtful config — global profile definitions.
+#
+# This file lives at $XDG_CONFIG_HOME/redoubtful/config.toml (default
+# ~/.config/redoubtful/config.toml). It was auto-generated on first
+# run; edit it freely. An empty file is also valid and means "no
+# profiles defined."
+#
+# Profiles are facets: each one bundles the equivalent of a few CLI
+# flags (-m, -e, -P, ...) under a name you can apply with
+# `redoubtful run -p NAME`. Multiple `-p` flags compose left-to-right
+# with last-wins on scalars (--readonly, --path) and append-in-order
+# on lists (-m, -e, -P). CLI flags layer on top of profiles.
+#
+# A profile can also pull in others via `uses`:
+#
+#   [profile.my-stack]
+#   uses = ["git-config", "rust", "node"]
+#
+# Strict no-repeats: a profile reached via two `uses` paths is a
+# config error, not a diamond to silently merge.
+#
+# Path values support a leading `~/` (expanded against $HOME) or
+# absolute paths. `~user/` and relative paths are not supported.
+#
+# See the `redoubtful run --help` output for the full flag surface;
+# every flag has a config equivalent.
+
+# Profile for running `opencode` inside the sandbox. Mirrors the
+# invocation documented in README's Usage section:
+#
+#   redoubtful run -m ~/.opencode -m ~/.config/opencode \
+#                  -P ~/.opencode/bin opencode
+#
+# Apply with: `redoubtful run -p opencode opencode`.
+[profile.opencode]
+mount = [
+    # Opencode's working state (sessions, history, downloaded
+    # models). Mirrors README's `-m ~/.opencode`. Add `access =
+    # "rw"` here if you want the sandboxed agent to be able to
+    # persist state across runs.
+    { host = "~/.opencode" },
+    # Opencode's declarative config (model choice, tool toggles,
+    # etc.). Read-only is enough.
+    { host = "~/.config/opencode" },
+]
+# The opencode CLI installs into ~/.opencode/bin; prepend it so the
+# sandbox can find the binary without `--path` rebuilding the whole
+# canonical PATH.
+path_add = ["~/.opencode/bin"]

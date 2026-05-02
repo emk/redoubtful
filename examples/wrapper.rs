@@ -12,8 +12,7 @@
 //! Build with `cargo build --example wrapper`. Path attaches at
 //! `<repo>/target/debug/examples/wrapper`.
 
-use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::{os::unix::process::CommandExt, process::Command};
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args_os().skip(1);

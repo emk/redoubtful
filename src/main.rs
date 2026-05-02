@@ -4,10 +4,9 @@ mod argv;
 mod bwrap;
 mod check;
 mod cmd;
-mod env;
+mod config;
+mod dirs;
 mod errors;
-mod forward;
-mod mounts;
 mod pasta;
 mod prelude;
 

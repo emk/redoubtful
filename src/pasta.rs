@@ -50,16 +50,14 @@
 
 use std::ffi::OsString;
 
-use crate::argv::ArgvBuilder;
-use crate::forward::ForwardList;
-use crate::prelude::*;
+use crate::{argv::ArgvBuilder, config::forwards::Forwards, prelude::*};
 
 /// Build the full argv for `pasta` (not including `pasta` itself),
 /// ending with `-- <child argv...>` (typically the bwrap command).
 #[instrument(level = "debug", skip_all,
     fields(n_forwards = forwards.iter().count()))]
 pub fn pasta_argv(
-    forwards: &ForwardList,
+    forwards: &Forwards,
     child_argv: Vec<OsString>,
 ) -> Vec<OsString> {
     let mut a = ArgvBuilder::default();
@@ -111,7 +109,6 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
-    use crate::forward::ForwardSource;
 
     fn os(s: &str) -> OsString {
         OsString::from(s)
@@ -123,7 +120,7 @@ mod tests {
 
     #[test]
     fn argv_includes_required_network_flags() {
-        let forwards = ForwardList::new();
+        let forwards = Forwards::default();
         let argv = pasta_argv(&forwards, vec![]);
         assert!(argv.contains(&os("--config-net")));
         assert!(argv.contains(&os("--no-map-gw")));
@@ -135,7 +132,7 @@ mod tests {
 
     #[test]
     fn argv_disables_namespace_to_host_forwarding() {
-        let forwards = ForwardList::new();
+        let forwards = Forwards::default();
         let argv = pasta_argv(&forwards, vec![]);
         let t_pos = position(&argv, "-t").expect("-t flag present");
         assert_eq!(argv.get(t_pos + 1), Some(&os("none")));
@@ -143,7 +140,7 @@ mod tests {
 
     #[test]
     fn argv_uses_t_capital_none_when_no_forwards() {
-        let forwards = ForwardList::new();
+        let forwards = Forwards::default();
         let argv = pasta_argv(&forwards, vec![]);
         let t_pos = position(&argv, "-T").expect("-T flag present");
         assert_eq!(argv.get(t_pos + 1), Some(&os("none")));
@@ -151,9 +148,9 @@ mod tests {
 
     #[test]
     fn argv_uses_t_capital_list_when_forwards_present() {
-        let mut forwards = ForwardList::new();
-        forwards.forward(8080, 8080, ForwardSource::Cli);
-        forwards.forward(5432, 9999, ForwardSource::Cli);
+        let mut forwards = Forwards::default();
+        forwards.forward(8080, 8080);
+        forwards.forward(5432, 9999);
         let argv = pasta_argv(&forwards, vec![]);
         let t_pos = position(&argv, "-T").expect("-T flag present");
         assert_eq!(argv.get(t_pos + 1), Some(&os("8080,5432:9999")));
@@ -161,7 +158,7 @@ mod tests {
 
     #[test]
     fn child_argv_appears_after_double_dash() {
-        let forwards = ForwardList::new();
+        let forwards = Forwards::default();
         let argv = pasta_argv(&forwards, vec![os("bwrap"), os("--share-net")]);
         let dash = position(&argv, "--").expect("-- separator present");
         assert_eq!(argv.get(dash + 1), Some(&os("bwrap")));

@@ -3,17 +3,23 @@
 //! Combined audit/inspector for mounts + TCP forwards. Tests and humans
 //! both consume this as the source of truth for "what would
 //! `run -m … -f …` actually configure?". Mirroring `run`'s setup
-//! (same `MountOpts`/`ForwardOpts`, same baseline construction) means
-//! the answer can't drift from what `run` actually builds.
+//! (same [`crate::config::config_file::ConfigFile::finalize_config_with_cli`]
+//! pipeline) means the answer can't drift from what `run` actually builds.
 
 use std::io::{self, Write as _};
 
 use serde::Serialize;
 
-use crate::env::{EnvList, EnvOpts};
-use crate::forward::{ForwardList, ForwardOpts};
-use crate::mounts::{MountList, MountOpts, current_dir, home_dir};
-use crate::prelude::*;
+use crate::{
+    config::{
+        config_file::ConfigFile,
+        env_vars::EnvVars,
+        forwards::Forwards,
+        mounts::Mounts,
+        profile::{Profile, ProfileDecl},
+    },
+    prelude::*,
+};
 
 /// Arguments to `redoubtful show`.
 #[derive(Debug, clap::Args)]
@@ -24,62 +30,34 @@ pub struct Args {
     #[arg(long, required = true)]
     pub json: bool,
 
-    /// `-m, --mount` and `--readonly` flags, mirrored from `run`
-    /// so the inventory output reflects whatever mounts the user
-    /// would get with the same flags.
-    #[command(flatten)]
-    pub mount_opts: MountOpts,
-
-    /// `-f, --forward` flags, mirrored from `run`.
-    #[command(flatten)]
-    pub forward_opts: ForwardOpts,
-
-    /// `-e, --env` and `--path` flags, mirrored from `run`.
-    #[command(flatten)]
-    pub env_opts: EnvOpts,
+    /// The crate to use
+    #[clap(flatten)]
+    pub profile: ProfileDecl,
 }
 
 /// Top-level JSON envelope: one object holding all inventories.
 #[derive(Serialize)]
 struct Output<'a> {
-    mounts: &'a MountList,
-    forwards: &'a ForwardList,
-    env: &'a EnvList,
+    mounts: &'a Mounts,
+    forwards: &'a Forwards,
+    env: &'a EnvVars,
 }
 
 /// Print the sandbox config `run` would build.
 #[instrument(level = "debug", name = "show", skip_all)]
 pub async fn cmd_show(args: Args) -> Result<()> {
-    let Args {
-        json: _,
-        mount_opts,
-        forward_opts,
-        env_opts,
-    } = args;
+    let Args { json: _, profile } = args;
+    debug!(?profile, "show sandbox config");
 
-    // Validate first so a bad CLI mount fails before any output —
-    // matches `run`'s behavior so the two stay in sync.
-    mount_opts.validate()?;
-
-    let home = home_dir()?;
-    let cwd = current_dir()?;
-    let mut mounts =
-        MountList::default_baseline(&home, &cwd, mount_opts.cwd_access());
-    mount_opts.apply(&mut mounts);
-
-    let mut forwards = ForwardList::default_baseline();
-    forward_opts.apply(&mut forwards);
-
-    // Mirror `cmd_run`'s env construction so `show --json` describes
-    // exactly what `run` would emit at this same instant — same
-    // `home` path goes into `default_baseline` so the env and the
-    // mount layer agree on `$HOME`.
-    let mut env = EnvList::default_baseline(
-        &home,
-        env_opts.path.as_deref(),
-        &env_opts.path_add,
-    );
-    env_opts.apply(&mut env);
+    // [`ConfigFile::finalize_config_with_cli`] is shared with
+    // `cmd_run` so `show -p X` describes exactly what `run -p X`
+    // would build, including the up-front `validate()` pass on every
+    // resolved profile (TOML + CLI).
+    let Profile {
+        mounts,
+        forwards,
+        env,
+    } = ConfigFile::finalize_config_with_cli(&profile)?;
 
     let body = Output {
         mounts: &mounts,

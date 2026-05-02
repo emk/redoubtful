@@ -20,60 +20,57 @@
 // primitive the workspace lint comment carves out — see Cargo.toml.
 #![allow(unsafe_code)]
 
-use std::ffi::OsString;
-use std::os::unix::process::ExitStatusExt as _;
+use std::{ffi::OsString, os::unix::process::ExitStatusExt as _};
 
-use tokio::process::Command;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::{
+    process::Command,
+    signal::unix::{SignalKind, signal},
+};
 
-use crate::bwrap::bwrap_argv;
-use crate::check::{any_failed, print_report_to_stderr, run_all_checks};
-use crate::env::{EnvList, EnvOpts};
-use crate::forward::{ForwardList, ForwardOpts};
-use crate::mounts::{MountList, MountOpts, current_dir, home_dir};
-use crate::pasta::pasta_argv;
-use crate::prelude::*;
+use crate::{
+    bwrap::bwrap_argv,
+    check::{any_failed, print_report_to_stderr, run_all_checks},
+    config::{
+        config_file::ConfigFile,
+        profile::{Profile, ProfileDecl},
+    },
+    dirs::current_dir,
+    pasta::pasta_argv,
+    prelude::*,
+};
 
 /// Arguments to `redoubtful run`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// `-m, --mount` and `--readonly` flags.
-    #[command(flatten)]
-    pub mount_opts: MountOpts,
-
-    /// `-f, --forward` flags.
-    #[command(flatten)]
-    pub forward_opts: ForwardOpts,
-
-    /// `-e, --env` and `--path` flags.
-    #[command(flatten)]
-    pub env_opts: EnvOpts,
+    #[clap(flatten)]
+    pub profile: ProfileDecl,
 
     /// The command to execute, e.g. `redoubtful run cargo build`.
+    /// `OsString` so a non-UTF-8 binary name on the host (rare but
+    /// possible) reaches `execve` byte-for-byte.
     #[arg(value_name = "COMMAND")]
-    pub command: String,
+    pub command: OsString,
 
     /// Arguments to pass to the command. Hyphen-prefixed args pass through
-    /// as-is.
+    /// as-is. `OsString` so any byte the user could pass on a Unix
+    /// command line survives into the sandboxed argv.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
         value_name = "ARGS"
     )]
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
 }
 
 /// Execute `<command> [args...]` inside a pasta + bwrap sandbox.
 #[instrument(level = "debug", name = "run", skip_all)]
 pub async fn cmd_run(args: Args) -> Result<()> {
     let Args {
-        mount_opts,
-        forward_opts,
-        env_opts,
+        profile,
         command,
         args,
     } = args;
-    debug!(command, ?args, "executing command in sandbox");
+    debug!(?command, ?args, "executing command in sandbox");
 
     // Preflight: verify bwrap/pasta are on PATH and user namespaces
     // can be created. On failure, emit the same report `redoubtful
@@ -86,33 +83,21 @@ pub async fn cmd_run(args: Args) -> Result<()> {
         return Err(Error::exit("redoubtful run", 1));
     }
 
-    // Validate CLI mount sources up-front so we don't fail deep
-    // inside bwrap setup with a less helpful diagnostic.
-    mount_opts.validate()?;
-
-    // ----- Build the mount and forward inventories -----
-    let home = home_dir()?;
-    let cwd = current_dir()?;
-    let mut mounts =
-        MountList::default_baseline(&home, &cwd, mount_opts.cwd_access());
-    mount_opts.apply(&mut mounts);
-
-    let mut forwards = ForwardList::default_baseline();
-    forward_opts.apply(&mut forwards);
-
-    // ----- Build the env inventory -----
+    // ----- Build the mount/forward/env inventories -----
     //
-    // `default_baseline` resolves passthroughs against the host env
-    // now, so by the time we hand `&env` to bwrap_argv every entry
-    // has a concrete value. The same `home` path is reused for
-    // `$HOME` here and for the bind-mount layer above so env and
-    // mounts agree on where the agent's files live.
-    let mut env = EnvList::default_baseline(
-        &home,
-        env_opts.path.as_deref(),
-        &env_opts.path_add,
-    );
-    env_opts.apply(&mut env);
+    // [`ConfigFile::finalize_config_with_cli`] owns the load-config →
+    // normalize-paths → resolve-uses → validate → resolve-decls →
+    // merge → finalize pipeline. `cmd_show` calls the same helper so
+    // both commands describe identical sandbox configurations for
+    // identical arguments. Even when no `-p` was passed we still go
+    // through it: a malformed config surfaces as a span-rendered
+    // miette diagnostic on the next run rather than lying dormant.
+    let cwd = current_dir()?;
+    let Profile {
+        mounts,
+        forwards,
+        env,
+    } = ConfigFile::finalize_config_with_cli(&profile)?;
 
     // ----- Assemble bwrap and pasta argvs -----
     let bwrap_args = bwrap_argv(&mounts, &env, &cwd, &command, &args);
@@ -207,8 +192,12 @@ pub async fn cmd_run(args: Args) -> Result<()> {
 
     // The user's mental model is that their command is what ran;
     // surface that in error variants alongside the pasta+bwrap
-    // wrapping so the diagnostic stays honest.
-    let cmd_summary = format!("pasta bwrap {}", command);
+    // wrapping so the diagnostic stays honest. The command is an
+    // `OsString` to preserve byte-clean argv on the way down — but
+    // by the time we're rendering an exit-code diagnostic, we're
+    // squarely in user-facing diagnostic territory where the
+    // policy permits silent lossy display.
+    let cmd_summary = format!("pasta bwrap {}", command.to_string_lossy());
     match (status.code(), status.signal()) {
         (Some(0), _) => Ok(()),
         (Some(code), _) => Err(Error::exit(cmd_summary, code)),
