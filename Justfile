@@ -10,6 +10,13 @@ check:
     cargo deny check
     cargo test --all-features
 
+# Check only things we can check in a sandbox.
+check-sandbox:
+    cargo fmt -- --check # +nightly is even better, but not always available.
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo deny check
+    cargo test --all-features --bin redoubtful # Can't run tests/ in sandbox
+
 # Print the current version.
 version:
     @echo "{{VERSION}}"
