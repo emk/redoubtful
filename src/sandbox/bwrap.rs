@@ -29,13 +29,13 @@ use std::{
 };
 
 use crate::{
-    argv::ArgvBuilder,
     config::{
         env_vars::EnvVars,
         mount::{MountAccess, MountKind},
         mounts::Mounts,
     },
     prelude::*,
+    sandbox::argv::ArgvBuilder,
 };
 
 /// Build the full argv for `bwrap` (not including `bwrap` itself),

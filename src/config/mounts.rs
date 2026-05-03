@@ -2,7 +2,7 @@
 //!
 //! This is the security-critical inventory of every place inside
 //! the sandbox where data is exposed to or from the host. Both
-//! [`crate::bwrap::bwrap_argv`] and the `redoubtful show` subcommand
+//! [`crate::sandbox::bwrap::bwrap_argv`] and the `redoubtful show` subcommand
 //! consume the *same* inventory, so a reviewer (or the test suite)
 //! can audit it without reconstructing what the bwrap argv means.
 //!

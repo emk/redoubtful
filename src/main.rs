@@ -1,15 +1,12 @@
 //! Entry point for the `redoubtful` sandbox tool.
 
-mod argv;
-mod bwrap;
 mod check;
 mod cmd;
 mod config;
 mod dirs;
 mod errors;
-mod pasta;
 mod prelude;
-mod proxy;
+mod sandbox;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};

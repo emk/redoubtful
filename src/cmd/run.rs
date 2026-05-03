@@ -28,16 +28,14 @@ use tokio::{
 };
 
 use crate::{
-    bwrap::bwrap_argv,
     check::{any_failed, print_report_to_stderr, run_all_checks},
     config::{
         config_file::ConfigFile,
         profile::{Profile, ProfileDecl},
     },
     dirs::current_dir,
-    pasta::pasta_argv,
     prelude::*,
-    proxy::{proxy_env_vars, start_proxy},
+    sandbox::{bwrap_argv, pasta_argv, proxy_env_vars, start_proxy},
 };
 
 /// Arguments to `redoubtful run`.
@@ -106,7 +104,7 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     // hostnames host-side, and pipes bytes (no MITM, no credential
     // injection). This is what makes anything in the sandbox reach
     // the internet — without it, clients see "no DNS, no route" and
-    // hang on `getaddrinfo`. See `crate::proxy` for the rationale
+    // hang on `getaddrinfo`. See `crate::sandbox::proxy` for the rationale
     // behind the throwaway CA.
     //
     // The port is runtime-allocated infrastructure, not user policy:

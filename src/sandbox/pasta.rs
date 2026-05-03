@@ -50,7 +50,9 @@
 
 use std::ffi::OsString;
 
-use crate::{argv::ArgvBuilder, config::forwards::Forwards, prelude::*};
+use crate::{
+    config::forwards::Forwards, prelude::*, sandbox::argv::ArgvBuilder,
+};
 
 /// Build the full argv for `pasta` (not including `pasta` itself),
 /// ending with `-- <child argv...>` (typically the bwrap command).

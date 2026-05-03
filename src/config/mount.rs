@@ -9,7 +9,7 @@
 //!
 //! Each [`Mount`] records *what* is exposed and *how* (`--ro-bind`,
 //! `--bind`, `--tmpfs`, etc.). Bwrap's flag-name translation lives in
-//! [`crate::bwrap`].
+//! [`crate::sandbox::bwrap`].
 //!
 //! References (cited by URL throughout `mounts.rs` too):
 //!
@@ -207,7 +207,7 @@ pub struct Mount {
 /// The `Mount` variant covers both access modes the CLI exposes
 /// (`-m, --mount HOST[:SANDBOX[:rw|:ro]]`) via its [`MountAccess`]
 /// field; the bwrap flag-name translation (`--bind`/`--ro-bind`)
-/// lives in [`crate::bwrap`].
+/// lives in [`crate::sandbox::bwrap`].
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum MountKind {
