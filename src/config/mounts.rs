@@ -358,21 +358,50 @@ fn push_system_baseline(list: &mut Mounts) {
     //   <https://sloonz.github.io/posts/sandboxing-1/>
     //   <https://www.freedesktop.org/wiki/Software/systemd/TheCaseForTheUsrMerge/>
     //
-    // /etc is intentionally NOT exposed in v0. Every file we
-    // expose from /etc carries consequences that need to be
-    // reasoned about (e.g. /etc/passwd leaks the host username,
-    // real name from GECOS, login shell, and home path;
-    // /etc/nsswitch.conf plus /etc/passwd lets `getpwuid()`
-    // succeed and changes a lot of glibc behavior). Future steps
-    // add specific /etc/* paths as concrete features land that
-    // need them (TLS → /etc/ssl/certs/; git → /etc/gitconfig;
-    // user-aware tooling → a synthetic /etc/passwd written via
-    // FD à la the bwrap demo).
     list.mount("/usr", "/usr", MountAccess::Ro);
     list.symlink("/bin", "usr/bin");
     list.symlink("/sbin", "usr/sbin");
     list.symlink("/lib", "usr/lib");
     list.symlink("/lib64", "usr/lib64");
+
+    // ----- /etc read-only -----
+    //
+    // Whole-/etc ro-bind, matching `specs/ARCHITECTURE.md`. The
+    // alternative (cherry-pick /etc/ssl/, /etc/passwd, /etc/group,
+    // /etc/hosts, /etc/resolv.conf, /etc/nsswitch.conf, /etc/services,
+    // /etc/protocols, …) is a death by a thousand "why doesn't tool
+    // X work?" tickets; whole-/etc is one decision that buys
+    // every standard client — curl/git/openssl reading the system CA
+    // bundle, name-based ownership lookups (getpwuid/getgrgid), the
+    // half-dozen small files glibc consults — at once.
+    //
+    // Why it's safe even though /etc/shadow appears in the listing:
+    //
+    // - The bind mount doesn't bypass DAC. The kernel still consults
+    //   the file's owner/mode on every open. /etc/shadow is 0640
+    //   root:shadow, and `--unshare-all` (which includes
+    //   `--unshare-user`) puts the sandbox in a userns where uid 0
+    //   maps to the *host* user emk. emk doesn't own shadow, isn't
+    //   in the shadow group, and the others-bit is 0 → EACCES.
+    // - Capabilities in a userns only apply to resources owned by
+    //   uids/gids *mapped into* that userns. /etc/shadow is owned
+    //   by host root (uid 0), which isn't mapped — so even
+    //   CAP_DAC_READ_SEARCH inside the sandbox doesn't unlock it.
+    //   Nested userns inherit the same boundary; the mapping
+    //   chain always resolves back to emk's host uid.
+    //
+    // Consequence: `/etc/resolv.conf` is also visible. That's fine —
+    // pasta gives the netns no route to the host's resolvers, so
+    // tools that try to resolve directly fail fast (which is the
+    // intended outcome; the lesson is "use HTTPS_PROXY"). Without
+    // the file present, glibc's resolver hangs in some configurations
+    // before giving up — visible-but-unreachable is the better failure
+    // mode.
+    //
+    //   <https://man7.org/linux/man-pages/man7/user_namespaces.7.html>
+    //   <https://man.archlinux.org/man/bwrap.1.en>
+    //   `specs/ARCHITECTURE.md` filesystem table.
+    list.mount("/etc", "/etc", MountAccess::Ro);
 
     // ----- /dev, /proc, /tmp -----
     //
@@ -442,7 +471,7 @@ mod tests {
     #[test]
     fn base_config_includes_system_mounts_in_order() {
         // base_config doesn't touch host env for the system pieces
-        // (/usr, /dev, /proc, /tmp); only $HOME / $PWD differ.
+        // (/usr, /etc, /dev, /proc, /tmp); only $HOME / $PWD differ.
         let base = Mounts::default().base_config();
         let kinds: Vec<&str> = base
             .iter()
@@ -454,16 +483,40 @@ mod tests {
                 MountKind::Proc => "proc",
             })
             .collect();
-        // First: /usr ro-bind + the four symlinks + /dev + /proc + /tmp.
-        // After that: $HOME tmpfs (if HOME set) + $PWD bind (if cwd available).
+        // First: /usr ro-bind + the four symlinks + /etc ro-bind +
+        // /dev + /proc + /tmp. After that: $HOME tmpfs (if HOME set)
+        // + $PWD bind (if cwd available).
         assert_eq!(
-            &kinds[..8],
+            &kinds[..9],
             &[
-                "mount", "symlink", "symlink", "symlink", "symlink", "dev",
-                "proc", "tmpfs"
+                "mount", "symlink", "symlink", "symlink", "symlink", "mount",
+                "dev", "proc", "tmpfs"
             ],
             "system baseline ordering (got: {kinds:?})",
         );
+    }
+
+    #[test]
+    fn base_config_exposes_etc_read_only() {
+        // Pinned: /etc must be present in the baseline, ro-bound at
+        // its real path. This is what makes curl/git/openssl find the
+        // system CA bundle, what lets glibc's name lookups work, and
+        // what most "obviously expected" host config (resolv.conf,
+        // hosts, nsswitch.conf, services, protocols) flows through.
+        // If a future change drops it, the failure surface across
+        // standard clients is huge and silent — guard explicitly.
+        let base = Mounts::default().base_config();
+        let etc = base
+            .iter()
+            .find(|m| m.sandbox == Path::new("/etc"))
+            .expect("/etc baseline mount present");
+        match &etc.kind {
+            MountKind::Mount { host, access } => {
+                assert_eq!(host, Path::new("/etc"), "/etc binds at host path");
+                assert_eq!(*access, MountAccess::Ro, "/etc must be read-only");
+            }
+            other => panic!("/etc must be a Mount, got {other:?}"),
+        }
     }
 
     #[test]

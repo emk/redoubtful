@@ -9,6 +9,7 @@ mod dirs;
 mod errors;
 mod pasta;
 mod prelude;
+mod proxy;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};

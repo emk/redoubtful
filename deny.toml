@@ -19,13 +19,21 @@ targets = [
 ignore = []
 
 [licenses]
-# Allow common OSI-approved, non-copyleft licenses.
+# Allow common OSI-approved permissive (non-copyleft) licenses.
 allow = [
     "MIT",
+    "MIT-0",
     "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
     "ISC",
     "Zlib",
     "Unicode-3.0",
+    # Mozilla's CA root bundle ships under this Linux Foundation
+    # permissive data license; pulled in via `webpki-roots` (which
+    # arrives transitively through hudsucker's `rustls-client` and
+    # `tokio-tungstenite` dependencies).
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

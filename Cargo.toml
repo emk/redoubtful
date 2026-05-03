@@ -20,16 +20,28 @@ maintenance = { status = "experimental" }
 capctl = "0.2.4"
 clap = { version = "4.6.1", features = ["derive"] }
 console = "0.16"
+hudsucker = { version = "0.24.0", features = ["rcgen-ca", "rustls-client"] }
 libc = "0.2.186"
 miette = { version = "7.6.0", features = ["fancy"] }
+rcgen = "0.14.7"
+# `ring` feature so the proxy can install a pure-Rust crypto provider
+# at runtime via `rustls::crypto::ring::default_provider()`. Note:
+# hudsucker's `rustls-client` feature transitively enables `aws-lc-rs`
+# through `hyper-rustls`, so that backend's C code is in the binary
+# regardless. We prefer `ring` at runtime because it's the pure-Rust
+# path; revisiting aws-lc-rs vs ring at the dep-graph level is a
+# stage-2 concern (when MITM actually exercises the provider).
+rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
 tokio = { version = "1.52.1", features = [
     "macros",
+    "net",
     "process",
     "rt-multi-thread",
     "signal",
+    "sync",
 ] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 tracing = "0.1.44"

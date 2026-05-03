@@ -37,6 +37,7 @@ use crate::{
     dirs::current_dir,
     pasta::pasta_argv,
     prelude::*,
+    proxy::{proxy_env_vars, start_proxy},
 };
 
 /// Arguments to `redoubtful run`.
@@ -96,15 +97,34 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     let Profile {
         mounts,
         forwards,
-        env,
+        mut env,
     } = ConfigFile::finalize_config_with_cli(&profile)?;
+
+    // ----- Start the credential proxy -----
+    //
+    // Stage 1 is tunnel-only: the proxy accepts CONNECT, resolves
+    // hostnames host-side, and pipes bytes (no MITM, no credential
+    // injection). This is what makes anything in the sandbox reach
+    // the internet — without it, clients see "no DNS, no route" and
+    // hang on `getaddrinfo`. See `crate::proxy` for the rationale
+    // behind the throwaway CA.
+    //
+    // The port is runtime-allocated infrastructure, not user policy:
+    // we mutate the just-finalized `EnvVars` to inject HTTPS_PROXY
+    // and friends, and pass the port through `pasta_argv` separately
+    // from `Forwards` (which holds only user-declared forwards).
+    let proxy_handle = start_proxy().await?;
+    debug!(port = proxy_handle.port, "credential proxy listening");
+    for (name, value) in proxy_env_vars(proxy_handle.port) {
+        env.set(name, value);
+    }
 
     // ----- Assemble bwrap and pasta argvs -----
     let bwrap_args = bwrap_argv(&mounts, &env, &cwd, &command, &args);
     let mut child_argv = Vec::with_capacity(bwrap_args.len().saturating_add(1));
     child_argv.push(OsString::from("bwrap"));
     child_argv.extend(bwrap_args);
-    let pasta_args = pasta_argv(&forwards, child_argv);
+    let pasta_args = pasta_argv(&forwards, Some(proxy_handle.port), child_argv);
     debug!(cmd = "pasta", args = ?pasta_args, "running sandbox");
 
     // ----- Spawn pasta with PR_SET_PDEATHSIG -----
@@ -189,6 +209,15 @@ pub async fn cmd_run(args: Args) -> Result<()> {
             }
         }
     };
+
+    // Tear the proxy down before we render the sandbox's exit
+    // status. The runtime drop on process exit would clean it up
+    // anyway, but an explicit shutdown lets graceful_shutdown
+    // actually drain in-flight tunnels and keeps the debug log
+    // honest. Errors awaiting the task are swallowed inside
+    // `shutdown` — the user's exit code is the load-bearing thing
+    // here, not the proxy's last gasp.
+    proxy_handle.shutdown().await;
 
     // The user's mental model is that their command is what ran;
     // surface that in error variants alongside the pasta+bwrap

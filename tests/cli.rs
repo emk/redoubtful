@@ -468,6 +468,38 @@ fn host_loopback_is_unreachable_from_sandbox() {
     );
 }
 
+/// The launcher's tunnel-only HTTPS proxy is up by default and the
+/// sandbox sees `HTTPS_PROXY` pointing at it.
+///
+/// Stage 1 doesn't try to *use* the proxy from this test — that
+/// would require an upstream host whose reachability we control,
+/// which doesn't fit a hermetic suite. We only assert the wiring:
+/// the env var is set, the form is `http://127.0.0.1:<u16>`, and
+/// the port is non-zero. If those three things hold, sandboxed
+/// HTTPS-proxy-aware clients (npm, curl, …) have everything they
+/// need to start sending CONNECT to our listener.
+#[test]
+fn proxy_env_var_is_set_in_sandbox() {
+    let out = cmd()
+        .args(["run", "sh", "-c", "echo $HTTPS_PROXY"])
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stdout.trim();
+    let port_str =
+        line.strip_prefix("http://127.0.0.1:").unwrap_or_else(|| {
+            panic!(
+                "HTTPS_PROXY not in expected form. \
+             stdout: {stdout:?}\nstderr: {stderr:?}",
+            )
+        });
+    let port: u16 = port_str
+        .parse()
+        .unwrap_or_else(|e| panic!("port {port_str:?} not a u16: {e}"));
+    assert!(port > 0, "ephemeral port should be non-zero");
+}
+
 /// With `-f $port`, a host loopback service *is* reachable inside
 /// the sandbox. Mirrors the structure of the unreachable test above.
 #[test]
