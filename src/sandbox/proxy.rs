@@ -37,7 +37,12 @@ use hudsucker::{
 use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
-use crate::prelude::*;
+use crate::{
+    config::{
+        env_vars::EnvVars, forwards::Forwards, mounts::Mounts, profile::Profile,
+    },
+    prelude::*,
+};
 
 /// Handle to the running proxy task.
 ///
@@ -192,8 +197,7 @@ impl HttpHandler for TunnelOnlyHandler {
     }
 }
 
-/// Construct the proxy env-var pairs to inject into the sandbox's
-/// `EnvVars` inventory.
+/// Construct the proxy env-var inventory.
 ///
 /// Lives here (not in `cmd::run`) so the list of names stays beside
 /// the proxy itself: any future change to what the proxy accepts —
@@ -204,18 +208,37 @@ impl HttpHandler for TunnelOnlyHandler {
 /// drops the host's value: it nails the policy down at the bwrap
 /// layer rather than relying on absence-as-policy, and a future
 /// reader sees the rule rather than having to infer it.
-pub fn proxy_env_vars(port: u16) -> Vec<(&'static str, String)> {
+pub fn proxy_env_vars(port: u16) -> EnvVars {
     let url = format!("http://127.0.0.1:{port}");
-    vec![
-        ("HTTPS_PROXY", url.clone()),
-        ("https_proxy", url.clone()),
-        ("HTTP_PROXY", url.clone()),
-        ("http_proxy", url.clone()),
-        ("ALL_PROXY", url.clone()),
-        ("all_proxy", url),
-        ("NO_PROXY", String::new()),
-        ("no_proxy", String::new()),
-    ]
+    let mut env = EnvVars::default();
+    env.set("HTTPS_PROXY", &url);
+    env.set("https_proxy", &url);
+    env.set("HTTP_PROXY", &url);
+    env.set("http_proxy", &url);
+    env.set("ALL_PROXY", &url);
+    env.set("all_proxy", &url);
+    env.set("NO_PROXY", "");
+    env.set("no_proxy", "");
+    env
+}
+
+/// Build a resolved [`Profile`] representing the proxy's contribution.
+///
+/// This is a *resolved* (not declared) `Profile`: it contributes one
+/// same-port forward and 8 env vars, with no declarations to validate.
+/// Merged into the user's finalized profile via
+/// [`Finalize::merge_right_biased`] so proxy env vars win on any
+/// key collision.
+///
+/// See [`crate::config::Finalize`] for the `Finalize` trait.
+pub fn proxy_profile(port: u16) -> Profile {
+    let mut forwards = Forwards::default();
+    forwards.forward(port, port);
+    Profile {
+        mounts: Mounts::default(),
+        forwards,
+        env: proxy_env_vars(port),
+    }
 }
 
 #[cfg(test)]
@@ -224,24 +247,28 @@ mod tests {
 
     #[test]
     fn proxy_env_vars_populates_all_eight_names_with_matching_url() {
-        let pairs = proxy_env_vars(12345);
-        let names: Vec<&str> = pairs.iter().map(|(n, _)| *n).collect();
+        use std::ffi::OsStr;
+
+        let env = proxy_env_vars(12345);
+        let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+        // BTreeMap gives ASCII-sorted order (uppercase before lowercase;
+        // "HTTPS" < "HTTP_" because 'S' (0x53) < '_' (0x5F)).
         assert_eq!(
             names,
             vec![
-                "HTTPS_PROXY",
-                "https_proxy",
-                "HTTP_PROXY",
-                "http_proxy",
                 "ALL_PROXY",
-                "all_proxy",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
                 "NO_PROXY",
+                "all_proxy",
+                "http_proxy",
+                "https_proxy",
                 "no_proxy",
             ],
         );
 
         // The six proxy URLs all match and point at the bound port.
-        let expected = "http://127.0.0.1:12345";
+        let expected = OsStr::new("http://127.0.0.1:12345");
         for name in [
             "HTTPS_PROXY",
             "https_proxy",
@@ -250,23 +277,21 @@ mod tests {
             "ALL_PROXY",
             "all_proxy",
         ] {
-            let value = pairs
+            let entry = env
                 .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, v)| v.as_str())
+                .find(|e| e.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"));
-            assert_eq!(value, expected, "{name} value");
+            assert_eq!(&entry.value, expected, "{name} value");
         }
 
         // NO_PROXY family is empty — explicit-empty policy at the
         // bwrap layer (see `proxy_env_vars` doc).
         for name in ["NO_PROXY", "no_proxy"] {
-            let value = pairs
+            let entry = env
                 .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, v)| v.as_str())
+                .find(|e| e.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"));
-            assert_eq!(value, "", "{name} value");
+            assert_eq!(&entry.value, OsStr::new(""), "{name} value");
         }
     }
 

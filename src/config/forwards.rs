@@ -84,10 +84,7 @@ pub struct Forwards {
 }
 
 impl Forwards {
-    /// Append a single TCP port forward. Test-only helper for
-    /// constructing fixtures; production builds entries via
-    /// [`Decl::resolve`] on a [`ForwardDecls`].
-    #[cfg(test)]
+    /// Append a single TCP port forward.
     pub fn forward(&mut self, host_port: u16, sandbox_port: u16) -> &mut Self {
         self.forwards.push(Forward {
             host_port,

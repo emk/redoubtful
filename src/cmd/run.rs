@@ -30,12 +30,13 @@ use tokio::{
 use crate::{
     check::{any_failed, print_report_to_stderr, run_all_checks},
     config::{
+        Finalize,
         config_file::ConfigFile,
         profile::{Profile, ProfileDecl},
     },
     dirs::current_dir,
     prelude::*,
-    sandbox::{bwrap_argv, pasta_argv, proxy_env_vars, start_proxy},
+    sandbox::{bwrap_argv, pasta_argv, proxy_profile, start_proxy},
 };
 
 /// Arguments to `redoubtful run`.
@@ -92,11 +93,7 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     // through it: a malformed config surfaces as a span-rendered
     // miette diagnostic on the next run rather than lying dormant.
     let cwd = current_dir()?;
-    let Profile {
-        mounts,
-        forwards,
-        mut env,
-    } = ConfigFile::finalize_config_with_cli(&profile)?;
+    let user_profile = ConfigFile::finalize_config_with_cli(&profile)?;
 
     // ----- Start the credential proxy -----
     //
@@ -107,22 +104,31 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     // hang on `getaddrinfo`. See `crate::sandbox::proxy` for the rationale
     // behind the throwaway CA.
     //
-    // The port is runtime-allocated infrastructure, not user policy:
-    // we mutate the just-finalized `EnvVars` to inject HTTPS_PROXY
-    // and friends, and pass the port through `pasta_argv` separately
-    // from `Forwards` (which holds only user-declared forwards).
+    // We merge the proxy's resolved profile into the user's finalized
+    // profile. The proxy contributes one same-port forward and 8 env
+    // vars (HTTPS_PROXY and friends). Since this merge happens after
+    // finalization, the proxy profile is a raw `Profile` — no `path`,
+    // `path_add`, or `readonly` extras (finalization is a one-time
+    // operation). Right-biased merge means proxy env vars win on any
+    // key collision, which is correct: the user shouldn't be able to
+    // break the proxy by setting `HTTPS_PROXY` to something else.
     let proxy_handle = start_proxy().await?;
     debug!(port = proxy_handle.port, "credential proxy listening");
-    for (name, value) in proxy_env_vars(proxy_handle.port) {
-        env.set(name, value);
-    }
+    let profile_with_proxy =
+        user_profile.merge_right_biased(&proxy_profile(proxy_handle.port));
+
+    let Profile {
+        mounts,
+        forwards,
+        env,
+    } = profile_with_proxy;
 
     // ----- Assemble bwrap and pasta argvs -----
     let bwrap_args = bwrap_argv(&mounts, &env, &cwd, &command, &args);
     let mut child_argv = Vec::with_capacity(bwrap_args.len().saturating_add(1));
     child_argv.push(OsString::from("bwrap"));
     child_argv.extend(bwrap_args);
-    let pasta_args = pasta_argv(&forwards, Some(proxy_handle.port), child_argv);
+    let pasta_args = pasta_argv(&forwards, child_argv);
     debug!(cmd = "pasta", args = ?pasta_args, "running sandbox");
 
     // ----- Spawn pasta with PR_SET_PDEATHSIG -----

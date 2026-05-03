@@ -25,4 +25,4 @@ pub mod proxy;
 
 pub use bwrap::bwrap_argv;
 pub use pasta::pasta_argv;
-pub use proxy::{proxy_env_vars, start_proxy};
+pub use proxy::{proxy_profile, start_proxy};

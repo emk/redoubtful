@@ -56,18 +56,9 @@ use crate::{
 
 /// Build the full argv for `pasta` (not including `pasta` itself),
 /// ending with `-- <child argv...>` (typically the bwrap command).
-///
-/// `proxy_port`, if set, is the host-loopback port the launcher's
-/// in-process credential proxy is listening on (see `crate::proxy`).
-/// It's passed through `-T` alongside the user's forwards so
-/// sandboxed clients can reach the proxy at `127.0.0.1:<port>`.
-/// The proxy port is *infrastructure*, not user-declared policy, so
-/// it bypasses [`Forwards`] and arrives here as its own argument.
-#[instrument(level = "debug", skip_all,
-    fields(n_forwards = forwards.iter().count(), ?proxy_port))]
+#[instrument(level = "debug", skip_all, fields(n_forwards = forwards.iter().count()))]
 pub fn pasta_argv(
     forwards: &Forwards,
-    proxy_port: Option<u16>,
     child_argv: Vec<OsString>,
 ) -> Vec<OsString> {
     let mut a = ArgvBuilder::default();
@@ -96,16 +87,10 @@ pub fn pasta_argv(
     // -T (--tcp-ns) controls *host → namespace* forwarding; default
     // `auto` would forward every port currently bound on the host
     // into the netns. Replace with an explicit list (or `none`).
-    //
-    // Proxy port (if any) goes first in the list so it's easy to
-    // spot in `-T` traces; the user's forwards follow in their
-    // declared order. Pasta doesn't care about ordering, but a
-    // reader of the debug log does.
-    let tcp_ns = match (proxy_port, forwards.is_empty()) {
-        (None, true) => "none".to_string(),
-        (None, false) => forwards.format_for_pasta(),
-        (Some(p), true) => p.to_string(),
-        (Some(p), false) => format!("{p},{}", forwards.format_for_pasta()),
+    let tcp_ns = if forwards.is_empty() {
+        "none".to_string()
+    } else {
+        forwards.format_for_pasta()
     };
     a.pair_str("-T", &tcp_ns);
 
@@ -137,7 +122,7 @@ mod tests {
     #[test]
     fn argv_includes_required_network_flags() {
         let forwards = Forwards::default();
-        let argv = pasta_argv(&forwards, None, vec![]);
+        let argv = pasta_argv(&forwards, vec![]);
         assert!(argv.contains(&os("--config-net")));
         assert!(argv.contains(&os("--no-map-gw")));
         assert!(argv.contains(&os("--no-dhcp")));
@@ -149,15 +134,15 @@ mod tests {
     #[test]
     fn argv_disables_namespace_to_host_forwarding() {
         let forwards = Forwards::default();
-        let argv = pasta_argv(&forwards, None, vec![]);
+        let argv = pasta_argv(&forwards, vec![]);
         let t_pos = position(&argv, "-t").expect("-t flag present");
         assert_eq!(argv.get(t_pos + 1), Some(&os("none")));
     }
 
     #[test]
-    fn argv_uses_t_capital_none_when_no_forwards_and_no_proxy() {
+    fn argv_uses_t_capital_none_when_no_forwards() {
         let forwards = Forwards::default();
-        let argv = pasta_argv(&forwards, None, vec![]);
+        let argv = pasta_argv(&forwards, vec![]);
         let t_pos = position(&argv, "-T").expect("-T flag present");
         assert_eq!(argv.get(t_pos + 1), Some(&os("none")));
     }
@@ -167,27 +152,21 @@ mod tests {
         let mut forwards = Forwards::default();
         forwards.forward(8080, 8080);
         forwards.forward(5432, 9999);
-        let argv = pasta_argv(&forwards, None, vec![]);
+        let argv = pasta_argv(&forwards, vec![]);
         let t_pos = position(&argv, "-T").expect("-T flag present");
         assert_eq!(argv.get(t_pos + 1), Some(&os("8080,5432:9999")));
     }
 
     #[test]
-    fn argv_uses_proxy_port_alone_when_no_user_forwards() {
-        let forwards = Forwards::default();
-        let argv = pasta_argv(&forwards, Some(43210), vec![]);
-        let t_pos = position(&argv, "-T").expect("-T flag present");
-        assert_eq!(argv.get(t_pos + 1), Some(&os("43210")));
-    }
-
-    #[test]
-    fn argv_prepends_proxy_port_to_user_forwards() {
-        // Proxy port leads the list so it's easy to spot in debug
-        // traces; user forwards keep their declaration order.
+    fn argv_includes_proxy_port_as_a_forward() {
+        // The proxy port is now just another forward entry with no
+        // special treatment — `proxy_profile` adds it via
+        // `forwards.forward(port, port)`.
         let mut forwards = Forwards::default();
+        forwards.forward(43210, 43210);
         forwards.forward(8080, 8080);
         forwards.forward(5432, 9999);
-        let argv = pasta_argv(&forwards, Some(43210), vec![]);
+        let argv = pasta_argv(&forwards, vec![]);
         let t_pos = position(&argv, "-T").expect("-T flag present");
         assert_eq!(argv.get(t_pos + 1), Some(&os("43210,8080,5432:9999")));
     }
@@ -195,8 +174,7 @@ mod tests {
     #[test]
     fn child_argv_appears_after_double_dash() {
         let forwards = Forwards::default();
-        let argv =
-            pasta_argv(&forwards, None, vec![os("bwrap"), os("--share-net")]);
+        let argv = pasta_argv(&forwards, vec![os("bwrap"), os("--share-net")]);
         let dash = position(&argv, "--").expect("-- separator present");
         assert_eq!(argv.get(dash + 1), Some(&os("bwrap")));
         assert_eq!(argv.get(dash + 2), Some(&os("--share-net")));
