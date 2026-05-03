@@ -20,7 +20,9 @@
 // primitive the workspace lint comment carves out — see Cargo.toml.
 #![allow(unsafe_code)]
 
-use std::{ffi::OsString, os::unix::process::ExitStatusExt as _};
+use std::{
+    env::current_dir, ffi::OsString, os::unix::process::ExitStatusExt as _,
+};
 
 use tokio::{
     process::Command,
@@ -34,7 +36,6 @@ use crate::{
         config_file::ConfigFile,
         profile::{Profile, ProfileDecl},
     },
-    dirs::current_dir,
     prelude::*,
     sandbox::{bwrap_argv, pasta_argv, proxy_profile, start_proxy},
 };
@@ -92,7 +93,7 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     // identical arguments. Even when no `-p` was passed we still go
     // through it: a malformed config surfaces as a span-rendered
     // miette diagnostic on the next run rather than lying dormant.
-    let cwd = current_dir()?;
+    let cwd = current_dir().map_err(Error::could_not_get_cwd)?;
     let user_profile = ConfigFile::finalize_config_with_cli(&profile)?;
 
     // ----- Start the credential proxy -----

@@ -175,13 +175,10 @@ pub fn bwrap_argv(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
+    use std::{env::current_dir, ffi::OsStr};
 
     use super::*;
-    use crate::{
-        config::{Finalize, profile::Profile},
-        dirs::current_dir,
-    };
+    use crate::config::{Finalize, profile::Profile};
 
     fn os(s: &str) -> OsString {
         OsString::from(s)

@@ -3,7 +3,6 @@
 mod check;
 mod cmd;
 mod config;
-mod dirs;
 mod errors;
 mod prelude;
 mod sandbox;

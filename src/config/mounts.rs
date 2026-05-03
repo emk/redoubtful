@@ -43,14 +43,16 @@
 //! This file favors "comment overkill", in order to preserve security
 //! justifications and original reference information for our decisions.
 
-use std::path::{Path, PathBuf};
+use std::{
+    env::{current_dir, home_dir},
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeSeq};
 
 use super::mount::{Mount, MountAccess, MountDecl, MountKind};
 use crate::{
     config::{Decl, Finalize, NormalizeConfigPaths},
-    dirs::{current_dir, home_dir},
     prelude::*,
 };
 
@@ -309,11 +311,11 @@ impl Finalize for Mounts {
         // expose the real $HOME on top of the tmpfs and defeat the
         // hiding. v0 accepts this; harden later.
         match home_dir() {
-            Ok(home) => {
+            Some(home) => {
                 base.tmpfs(home);
             }
-            Err(e) => {
-                trace!(error = %e, "home_dir unavailable; dropping $HOME tmpfs");
+            None => {
+                trace!("$HOME not set; dropping $HOME tmpfs");
             }
         }
         match current_dir() {

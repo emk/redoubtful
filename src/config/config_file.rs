@@ -26,6 +26,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    env::home_dir,
     fs, io,
     path::Path,
 };
@@ -36,10 +37,7 @@ use super::{
     Decl, Finalize, NormalizeConfigPaths,
     profile::{Profile, ProfileDecl},
 };
-use crate::{
-    dirs::{config_path, home_dir},
-    prelude::*,
-};
+use crate::prelude::*;
 
 /// Parsed `~/.config/redoubtful/config.toml`.
 #[derive(Debug, Default, Deserialize)]
@@ -110,7 +108,9 @@ impl ConfigFile {
     /// per-domain baselines (system mounts, canonical PATH, etc.)
     /// land underneath every user contribution.
     pub fn finalize_config_with_cli(cli: &ProfileDecl) -> Result<Profile> {
-        let cfg_path = config_path()?;
+        let cfg_path = xdg::BaseDirectories::with_prefix("redoubtful")
+            .get_config_file("config.toml")
+            .ok_or_else(|| Error::missing_env_var("HOME"))?;
         let mut config = Self::load_or_init(&cfg_path)?;
 
         // `~/` normalization. Takes HOME up-front; the sub-domain
@@ -118,7 +118,7 @@ impl ConfigFile {
         // Done here (not in `load_or_init`) so `load_or_init` stays a
         // pure parse-from-disk constructor that callers can drive
         // without pulling in a HOME requirement.
-        let home = home_dir()?;
+        let home = home_dir().ok_or_else(|| Error::missing_env_var("HOME"))?;
         for p in config.profile_decls.values_mut() {
             p.normalize_config_paths(&home)?;
         }
