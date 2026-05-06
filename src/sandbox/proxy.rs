@@ -39,7 +39,8 @@ use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use crate::{
     config::{
-        env_vars::EnvVars, forwards::Forwards, mounts::Mounts, profile::Profile,
+        env_vars::EnvVars, forwards::Forwards, mounts::Mounts,
+        profile::Profile, proxies::Proxies,
     },
     prelude::*,
 };
@@ -238,6 +239,7 @@ pub fn proxy_profile(port: u16) -> Profile {
         mounts: Mounts::default(),
         forwards,
         env: proxy_env_vars(port),
+        proxies: Proxies::default(),
     }
 }
 

@@ -4,5 +4,7 @@ An overview of our implementation plan is in [`ARCHITECTURE.md`](../specs/ARCHIT
 
 - [ ] Fix config code
   - [ ] cli.rs has lots of config tests that should be unit tests, not config tests.
-  - [ ] config_path should probably use a crate, `xdg` looks good.
+  - [ ] Refactor common config-dir code (which is pretty trivial)
   - [ ] De-dup the code that auto-creates default config and secret files.
+  - [ ] De-dup new tests, especially proxy stuff
+  - [ ] Proptest merge_right_biased to make sure it fulfills monad laws.

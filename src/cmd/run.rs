@@ -124,6 +124,7 @@ pub async fn cmd_run(args: Args) -> Result<()> {
         mounts,
         forwards,
         env,
+        proxies: _,
     } = profile_with_proxy;
 
     // ----- Assemble bwrap and pasta argvs -----

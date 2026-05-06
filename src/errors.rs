@@ -293,6 +293,33 @@ pub enum Error {
         /// The error message from the template engine.
         message: String,
     },
+
+    /// The proxy host is empty.
+    #[error("proxy host is empty")]
+    ProxyEmptyHost,
+
+    /// The proxy port is not a valid port number.
+    #[error("proxy port `{port}` is not a valid port number")]
+    ProxyInvalidPort {
+        /// The offending port string.
+        port: String,
+    },
+
+    /// The proxy action is invalid (expected `allow` or `deny`).
+    #[error("proxy action `{action}` is invalid (expected `allow` or `deny`)")]
+    ProxyInvalidAction {
+        /// The offending action string.
+        action: String,
+    },
+
+    /// The proxy specification has invalid syntax.
+    #[error("proxy `{spec}` is invalid: {reason}")]
+    ProxyInvalidSyntax {
+        /// The offending specification.
+        spec: String,
+        /// Why we rejected it.
+        reason: String,
+    },
 }
 
 /// Boxed payload for [`Error::ConfigParse`].
@@ -500,5 +527,20 @@ impl Error {
     #[allow(dead_code)]
     pub fn template_render(message: String) -> Self {
         Self::TemplateRender { message }
+    }
+
+    /// Create an [`Error::ProxyInvalidPort`].
+    pub fn proxy_invalid_port(port: String) -> Self {
+        Self::ProxyInvalidPort { port }
+    }
+
+    /// Create an [`Error::ProxyInvalidAction`].
+    pub fn proxy_invalid_action(action: String) -> Self {
+        Self::ProxyInvalidAction { action }
+    }
+
+    /// Create an [`Error::ProxyInvalidSyntax`].
+    pub fn proxy_invalid_syntax(spec: String, reason: String) -> Self {
+        Self::ProxyInvalidSyntax { spec, reason }
     }
 }

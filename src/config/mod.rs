@@ -16,6 +16,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
 use crate::prelude::*;
 
 pub mod config_file;
@@ -26,7 +30,57 @@ pub mod forwards;
 pub mod mount;
 pub mod mounts;
 pub mod profile;
+pub mod proxies;
+pub mod proxy;
 pub mod resolve_context;
+
+/// A Handlebars template string, unresolved.
+///
+/// Carried in `ProxyDecl.headers`, `ProxyDecl.params`, and
+/// `ProxyAuthDecl` fields. Resolved to [`Secret`] via
+/// [`ResolveContext::render_template`] during [`Decl::resolve`].
+///
+/// [`ResolveContext`]: resolve_context::ResolveContext
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Template(pub String);
+
+/// A resolved secret string.
+///
+/// `Debug`, `Display`, and `Serialize` all redact the value to
+/// `"***"` so secrets never appear in logs, diagnostics, or
+/// `redoubtful show --json` output.
+///
+/// The inner `String` is consumed by the proxy server at runtime
+/// (Stage 3) — it is stored redacted in `Debug`/`Display`/`Serialize`
+/// but the raw value is available for actual credential injection.
+#[allow(dead_code)]
+#[derive(Clone, Default)]
+pub struct Secret(pub String);
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Secret").field(&"***").finish()
+    }
+}
+
+impl fmt::Display for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("***")
+    }
+}
+
+// We may actually someday need to serialize secrets as raw values.
+// We would need to think carefully about that, because it would
+// have substantial security implications that would require human
+// sign-off.
+impl Serialize for Secret {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str("***")
+    }
+}
 
 /// Trait for **declared** configuration, as specified by the user.
 pub trait Decl {

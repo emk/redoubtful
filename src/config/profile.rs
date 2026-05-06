@@ -52,6 +52,8 @@ use super::{
     forwards::{ForwardDecls, Forwards},
     mount::MountDecl,
     mounts::{MountDecls, Mounts},
+    proxies::{Proxies, ProxyDecls},
+    proxy::ProxyDecl,
 };
 use crate::{
     config::{
@@ -98,6 +100,10 @@ pub struct ProfileDecl {
     /// `path_add` list.
     #[clap(flatten)]
     pub env_decls: EnvVarDecls,
+
+    /// Proxy declarations (`--proxy`, `--public-web`).
+    #[clap(flatten)]
+    pub proxy_decls: ProxyDecls,
 }
 
 impl<'de> Deserialize<'de> for ProfileDecl {
@@ -131,6 +137,10 @@ impl<'de> Deserialize<'de> for ProfileDecl {
             path: Option<String>,
             #[serde(default)]
             path_add: Vec<String>,
+            #[serde(default)]
+            public_web: Option<super::proxy::ProxyAction>,
+            #[serde(default)]
+            proxies: Vec<ProxyDecl>,
         }
         let raw = Raw::deserialize(d)?;
         // TOML is UTF-8 only, but `EnvVarDecls.path` / `path_add` are
@@ -156,6 +166,10 @@ impl<'de> Deserialize<'de> for ProfileDecl {
                     .map(OsString::from)
                     .collect(),
             },
+            proxy_decls: ProxyDecls {
+                public_web: raw.public_web,
+                proxies: raw.proxies,
+            },
         })
     }
 }
@@ -171,7 +185,8 @@ impl Decl for ProfileDecl {
     fn validate(&self) -> Result<()> {
         self.mount_decls.validate()?;
         self.forward_decls.validate()?;
-        self.env_decls.validate()
+        self.env_decls.validate()?;
+        self.proxy_decls.validate()
     }
 
     /// Resolve into a [`Profile`] by resolving each sub-domain in
@@ -184,6 +199,7 @@ impl Decl for ProfileDecl {
             mounts: self.mount_decls.resolve(ctx)?,
             forwards: self.forward_decls.resolve(ctx)?,
             env: self.env_decls.resolve(ctx)?,
+            proxies: self.proxy_decls.resolve(ctx)?,
         })
     }
 }
@@ -213,6 +229,9 @@ pub struct Profile {
     /// Resolved env inventory plus the `path` / `path_add` extras
     /// (cleared during `Finalize::finalize`).
     pub env: EnvVars,
+
+    /// Resolved proxy inventory.
+    pub proxies: Proxies,
 }
 
 impl Finalize for Profile {
@@ -229,6 +248,7 @@ impl Finalize for Profile {
             mounts: self.mounts.merge_right_biased(&other.mounts),
             forwards: self.forwards.merge_right_biased(&other.forwards),
             env: self.env.merge_right_biased(&other.env),
+            proxies: self.proxies.merge_right_biased(&other.proxies),
         }
     }
 
@@ -242,6 +262,7 @@ impl Finalize for Profile {
             mounts: self.mounts.base_config(),
             forwards: self.forwards.base_config(),
             env: self.env.base_config(),
+            proxies: self.proxies.base_config(),
         }
     }
 
@@ -340,6 +361,7 @@ mod tests {
                 path: Some(OsString::from("/only/this")),
                 path_add: vec![OsString::from("/extra")],
             },
+            proxy_decls: ProxyDecls::default(),
         };
         let ctx = ResolveContext::empty();
         let resolved = decl.resolve(&ctx).expect("resolves");
@@ -389,6 +411,7 @@ mod tests {
             .resolve(&ctx)
             .expect("resolves"),
             env: left_env,
+            proxies: Proxies::default(),
         };
 
         let mut right_env = EnvVars::default();
@@ -414,6 +437,7 @@ mod tests {
             .resolve(&ctx)
             .expect("resolves"),
             env: right_env,
+            proxies: Proxies::default(),
         };
 
         let merged = left.merge_right_biased(&right);
@@ -499,6 +523,7 @@ mod tests {
             mounts,
             forwards: Forwards::default(),
             env,
+            proxies: Proxies::default(),
         };
 
         profile.clear_extra_fields();
@@ -568,6 +593,7 @@ mod tests {
                 path: None,
                 path_add: Vec::new(),
             },
+            proxy_decls: ProxyDecls::default(),
         };
         let ctx = ResolveContext::empty();
         let final_ = decl.resolve(&ctx).expect("resolves").finalize();

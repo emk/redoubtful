@@ -59,6 +59,7 @@ pub async fn cmd_show(args: Args) -> Result<()> {
         mounts,
         forwards,
         env,
+        proxies: _,
     } = ConfigFile::finalize_config_with_cli(&profile, &ctx)?;
 
     let body = Output {
