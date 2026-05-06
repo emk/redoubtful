@@ -75,7 +75,10 @@ use serde::{Serialize, Serializer, ser::SerializeSeq};
 
 use super::env_var::EnvVar;
 use crate::{
-    config::{Decl, Finalize, NormalizeConfigPaths, env_var::EnvVarDecl},
+    config::{
+        Decl, Finalize, NormalizeConfigPaths, env_var::EnvVarDecl,
+        resolve_context,
+    },
     prelude::*,
 };
 
@@ -240,10 +243,13 @@ impl Decl for EnvVarDecls {
         Ok(())
     }
 
-    fn resolve(&self) -> Result<Self::Resolved> {
+    fn resolve(
+        &self,
+        ctx: &resolve_context::ResolveContext,
+    ) -> Result<Self::Resolved> {
         let mut vars = BTreeMap::new();
         for decl in &self.env {
-            if let Some(env_var) = decl.resolve()? {
+            if let Some(env_var) = decl.resolve(ctx)? {
                 vars.insert(env_var.name.clone(), env_var);
             }
         }
@@ -600,7 +606,8 @@ mod tests {
             path: None,
             path_add: Vec::new(),
         };
-        let env = decls.resolve().expect("resolves").finalize();
+        let ctx = resolve_context::ResolveContext::empty();
+        let env = decls.resolve(&ctx).expect("resolves").finalize();
         assert_eq!(entry(&env, "PATH").value, OsStr::new("/only/this"));
         assert_eq!(
             env.iter().filter(|e| e.name == "PATH").count(),
@@ -760,7 +767,8 @@ mod tests {
             path: None,
             path_add: vec![OsString::from_vec(raw.clone())],
         };
-        let env = decls.resolve().expect("resolves").finalize();
+        let ctx = resolve_context::ResolveContext::empty();
+        let env = decls.resolve(&ctx).expect("resolves").finalize();
         let path_value = &entry(&env, "PATH").value;
         let prefix = format!(":{CANONICAL_PATH}");
         let mut expected = raw.clone();

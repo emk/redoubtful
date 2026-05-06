@@ -26,6 +26,7 @@ pub mod forwards;
 pub mod mount;
 pub mod mounts;
 pub mod profile;
+pub mod resolve_context;
 
 /// Trait for **declared** configuration, as specified by the user.
 pub trait Decl {
@@ -36,8 +37,12 @@ pub trait Decl {
     /// messages to the user (instead of failing cryptically later).
     fn validate(&self) -> Result<()>;
 
-    /// Resolve the value from the environment.
-    fn resolve(&self) -> Result<Self::Resolved>;
+    /// Resolve the value from the environment using `ctx` (which
+    /// contains things like our Handlebars renderer and secrets).
+    fn resolve(
+        &self,
+        ctx: &resolve_context::ResolveContext,
+    ) -> Result<Self::Resolved>;
 }
 
 /// Trait for taking a resolved configuration from [`Decl::resolve`] and finalizing it.

@@ -35,6 +35,7 @@ use crate::{
         Finalize,
         config_file::ConfigFile,
         profile::{Profile, ProfileDecl},
+        resolve_context::ResolveContext,
     },
     prelude::*,
     sandbox::{bwrap_argv, pasta_argv, proxy_profile, start_proxy},
@@ -94,7 +95,8 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     // through it: a malformed config surfaces as a span-rendered
     // miette diagnostic on the next run rather than lying dormant.
     let cwd = current_dir().map_err(Error::could_not_get_cwd)?;
-    let user_profile = ConfigFile::finalize_config_with_cli(&profile)?;
+    let ctx = ResolveContext::new()?;
+    let user_profile = ConfigFile::finalize_config_with_cli(&profile, &ctx)?;
 
     // ----- Start the credential proxy -----
     //

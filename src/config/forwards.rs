@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 use super::forward::{Forward, ForwardDecl};
 use crate::{
-    config::{Decl, Finalize},
+    config::{Decl, Finalize, resolve_context},
     prelude::*,
 };
 
@@ -55,11 +55,14 @@ impl Decl for ForwardDecls {
         Ok(())
     }
 
-    fn resolve(&self) -> Result<Self::Resolved> {
+    fn resolve(
+        &self,
+        ctx: &resolve_context::ResolveContext,
+    ) -> Result<Self::Resolved> {
         let forwards = self
             .forwards
             .iter()
-            .map(|d| d.resolve())
+            .map(|d| d.resolve(ctx))
             .collect::<Result<Vec<_>>>()?;
         Ok(Forwards { forwards })
     }
@@ -202,7 +205,8 @@ mod tests {
                 },
             ],
         };
-        let forwards = decls.resolve().expect("resolves").finalize();
+        let ctx = resolve_context::ResolveContext::empty();
+        let forwards = decls.resolve(&ctx).expect("resolves").finalize();
         assert_eq!(forwards.format_for_pasta(), "8080,5432:9999");
     }
 }

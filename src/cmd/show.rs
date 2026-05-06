@@ -17,6 +17,7 @@ use crate::{
         forwards::Forwards,
         mounts::Mounts,
         profile::{Profile, ProfileDecl},
+        resolve_context::ResolveContext,
     },
     prelude::*,
 };
@@ -53,11 +54,12 @@ pub async fn cmd_show(args: Args) -> Result<()> {
     // `cmd_run` so `show -p X` describes exactly what `run -p X`
     // would build, including the up-front `validate()` pass on every
     // resolved profile (TOML + CLI).
+    let ctx = ResolveContext::new()?;
     let Profile {
         mounts,
         forwards,
         env,
-    } = ConfigFile::finalize_config_with_cli(&profile)?;
+    } = ConfigFile::finalize_config_with_cli(&profile, &ctx)?;
 
     let body = Output {
         mounts: &mounts,

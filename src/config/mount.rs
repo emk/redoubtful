@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use toml::Spanned;
 
 use crate::{
-    config::{Decl, NormalizeConfigPaths},
+    config::{Decl, NormalizeConfigPaths, resolve_context::ResolveContext},
     prelude::*,
 };
 
@@ -178,7 +178,7 @@ impl Decl for MountDecl {
         Ok(())
     }
 
-    fn resolve(&self) -> Result<Self::Resolved> {
+    fn resolve(&self, _ctx: &ResolveContext) -> Result<Self::Resolved> {
         Ok(Mount {
             sandbox: self.sandbox_path().to_owned(),
             kind: MountKind::Mount {
@@ -327,10 +327,11 @@ mod tests {
 
     #[test]
     fn mount_decl_resolve_yields_mount() {
+        let ctx = ResolveContext::empty();
         // Single-path: host == sandbox, default ro.
         let single = parse("/etc/gitconfig")
             .unwrap()
-            .resolve()
+            .resolve(&ctx)
             .expect("resolves");
         assert_eq!(single.sandbox, PathBuf::from("/etc/gitconfig"));
         match single.kind {
@@ -344,7 +345,7 @@ mod tests {
         // Explicit sandbox + rw.
         let remap = parse("/host/x:/sandbox/y:rw")
             .unwrap()
-            .resolve()
+            .resolve(&ctx)
             .expect("resolves");
         assert_eq!(remap.sandbox, PathBuf::from("/sandbox/y"));
         match remap.kind {

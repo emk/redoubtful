@@ -26,7 +26,10 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use toml::Spanned;
 
-use crate::{config::Decl, prelude::*};
+use crate::{
+    config::{Decl, resolve_context},
+    prelude::*,
+};
 
 /// A single port-forward specification: the host port and an
 /// optional sandbox port.
@@ -120,7 +123,10 @@ impl Decl for ForwardDecl {
         Ok(())
     }
 
-    fn resolve(&self) -> Result<Self::Resolved> {
+    fn resolve(
+        &self,
+        _ctx: &resolve_context::ResolveContext,
+    ) -> Result<Self::Resolved> {
         Ok(Forward {
             host_port: *self.host_port.get_ref(),
             sandbox_port: self.sandbox_port(),
@@ -198,13 +204,15 @@ mod tests {
 
     #[test]
     fn forward_decl_resolve_yields_forward() {
+        let ctx = resolve_context::ResolveContext::empty();
         // Single-port spec: sandbox defaults to host.
-        let single = parse("8080").unwrap().resolve().expect("resolves");
+        let single = parse("8080").unwrap().resolve(&ctx).expect("resolves");
         assert_eq!(single.host_port, 8080);
         assert_eq!(single.sandbox_port, 8080);
 
         // Explicit remap: each side carries its own port.
-        let remap = parse("8080:9090").unwrap().resolve().expect("resolves");
+        let remap =
+            parse("8080:9090").unwrap().resolve(&ctx).expect("resolves");
         assert_eq!(remap.host_port, 8080);
         assert_eq!(remap.sandbox_port, 9090);
     }

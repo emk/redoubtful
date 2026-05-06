@@ -3,7 +3,7 @@ use std::{env, ffi::OsString, str::FromStr};
 use serde::{Serialize, Serializer};
 use toml::Spanned;
 
-use crate::prelude::*;
+use crate::{config::resolve_context, prelude::*};
 
 /// A single env override: a name plus an optional value.
 ///
@@ -49,7 +49,10 @@ impl super::Decl for EnvVarDecl {
         Ok(())
     }
 
-    fn resolve(&self) -> Result<Self::Resolved> {
+    fn resolve(
+        &self,
+        _ctx: &resolve_context::ResolveContext,
+    ) -> Result<Self::Resolved> {
         // Determine what value to use for the env var. Literals come
         // in as UTF-8 `String` (CLI/TOML), passthroughs come in as
         // `OsString` from `var_os` so non-UTF-8 host bytes pass
@@ -192,7 +195,8 @@ mod tests {
         // Literal CLI input is always UTF-8 String; resolve()
         // converts it losslessly into the EnvVar's OsString value.
         let decl = parse("FOO=bar").unwrap();
-        let resolved = decl.resolve().unwrap().expect("literal resolves");
+        let ctx = resolve_context::ResolveContext::empty();
+        let resolved = decl.resolve(&ctx).unwrap().expect("literal resolves");
         assert_eq!(resolved.name, "FOO");
         assert_eq!(resolved.value, OsStr::new("bar"));
     }
@@ -203,7 +207,8 @@ mod tests {
         // the host should resolve to None — the "drop the entry"
         // signal up to EnvVarDecls.
         let decl = parse("REDOUBTFUL_DEFINITELY_NOT_SET_4f7a8b").unwrap();
-        let resolved = decl.resolve().unwrap();
+        let ctx = resolve_context::ResolveContext::empty();
+        let resolved = decl.resolve(&ctx).unwrap();
         assert!(resolved.is_none(), "unset passthrough must resolve to None");
     }
 

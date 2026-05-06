@@ -36,6 +36,7 @@ use serde::Deserialize;
 use super::{
     Decl, Finalize, NormalizeConfigPaths,
     profile::{Profile, ProfileDecl},
+    resolve_context::ResolveContext,
 };
 use crate::prelude::*;
 
@@ -107,7 +108,10 @@ impl ConfigFile {
     /// the last layer → fold-merge right-biased → finalize so the
     /// per-domain baselines (system mounts, canonical PATH, etc.)
     /// land underneath every user contribution.
-    pub fn finalize_config_with_cli(cli: &ProfileDecl) -> Result<Profile> {
+    pub fn finalize_config_with_cli(
+        cli: &ProfileDecl,
+        ctx: &ResolveContext,
+    ) -> Result<Profile> {
         let cfg_path = xdg::BaseDirectories::with_prefix("redoubtful")
             .get_config_file("config.toml")
             .ok_or_else(|| Error::missing_env_var("HOME"))?;
@@ -146,9 +150,9 @@ impl ConfigFile {
         let mut chain: Vec<Profile> =
             Vec::with_capacity(resolved.len().saturating_add(1));
         for (_name, decl) in &resolved {
-            chain.push(decl.resolve()?);
+            chain.push(decl.resolve(ctx)?);
         }
-        chain.push(cli.resolve()?);
+        chain.push(cli.resolve(ctx)?);
         Ok(Profile::merge_all_right_biased(&chain).finalize())
     }
 }

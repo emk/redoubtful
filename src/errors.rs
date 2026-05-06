@@ -253,6 +253,46 @@ pub enum Error {
         /// Path to the config file we resolved against.
         config_path: PathBuf,
     },
+
+    /// Could not read the secrets file.
+    #[error("could not read secrets file `{}`", path.display())]
+    CouldNotReadSecrets {
+        /// The path we tried to read.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Could not parse the secrets file.
+    #[error("could not parse secrets file `{}`", path.display())]
+    CouldNotParseSecrets {
+        /// The path we tried to parse.
+        path: PathBuf,
+        /// The underlying parse error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Could not write the default secrets file during auto-init.
+    #[error("could not write secrets file `{}`", path.display())]
+    CouldNotWriteSecrets {
+        /// The path we tried to write.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// A Handlebars template failed to render. This includes
+    /// strict-mode violations (referencing undefined variables)
+    /// and other rendering failures.
+    #[allow(dead_code)]
+    #[error("template error: {message}")]
+    TemplateRender {
+        /// The error message from the template engine.
+        message: String,
+    },
 }
 
 /// Boxed payload for [`Error::ConfigParse`].
@@ -436,5 +476,29 @@ impl Error {
             span,
             message: e.message().to_owned(),
         }))
+    }
+
+    /// Create an [`Error::CouldNotReadSecrets`].
+    pub fn could_not_read_secrets(path: PathBuf, source: io::Error) -> Self {
+        Self::CouldNotReadSecrets { path, source }
+    }
+
+    /// Create an [`Error::CouldNotParseSecrets`].
+    pub fn could_not_parse_secrets(
+        path: PathBuf,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    ) -> Self {
+        Self::CouldNotParseSecrets { path, source }
+    }
+
+    /// Create an [`Error::CouldNotWriteSecrets`].
+    pub fn could_not_write_secrets(path: PathBuf, source: io::Error) -> Self {
+        Self::CouldNotWriteSecrets { path, source }
+    }
+
+    /// Create an [`Error::TemplateRender`].
+    #[allow(dead_code)]
+    pub fn template_render(message: String) -> Self {
+        Self::TemplateRender { message }
     }
 }

@@ -52,7 +52,9 @@ use serde::{Deserialize, Serialize, Serializer, ser::SerializeSeq};
 
 use super::mount::{Mount, MountAccess, MountDecl, MountKind};
 use crate::{
-    config::{Decl, Finalize, NormalizeConfigPaths},
+    config::{
+        Decl, Finalize, NormalizeConfigPaths, resolve_context::ResolveContext,
+    },
     prelude::*,
 };
 
@@ -123,11 +125,11 @@ impl Decl for MountDecls {
         Ok(())
     }
 
-    fn resolve(&self) -> Result<Self::Resolved> {
+    fn resolve(&self, ctx: &ResolveContext) -> Result<Self::Resolved> {
         let mounts = self
             .mounts
             .iter()
-            .map(|d| d.resolve())
+            .map(|d| d.resolve(ctx))
             .collect::<Result<Vec<_>>>()?;
         Ok(Mounts {
             mounts,
@@ -714,7 +716,8 @@ mod tests {
             mounts: vec![],
             readonly: Some(true),
         };
-        let resolved = decls.resolve().expect("resolves");
+        let ctx = ResolveContext::empty();
+        let resolved = decls.resolve(&ctx).expect("resolves");
         assert_eq!(resolved.readonly, Some(true));
         assert_eq!(resolved.iter().count(), 0);
     }
@@ -736,7 +739,8 @@ mod tests {
             ],
             readonly: None,
         };
-        let resolved = decls.resolve().expect("resolves");
+        let ctx = ResolveContext::empty();
+        let resolved = decls.resolve(&ctx).expect("resolves");
         let entries: Vec<(PathBuf, MountAccess)> = resolved
             .iter()
             .filter_map(|m| match &m.kind {

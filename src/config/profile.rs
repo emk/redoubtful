@@ -54,7 +54,9 @@ use super::{
     mounts::{MountDecls, Mounts},
 };
 use crate::{
-    config::{Decl, Finalize, NormalizeConfigPaths},
+    config::{
+        Decl, Finalize, NormalizeConfigPaths, resolve_context::ResolveContext,
+    },
     prelude::*,
 };
 
@@ -177,11 +179,11 @@ impl Decl for ProfileDecl {
     /// extras (`Mounts::readonly`, `EnvVars::path` / `path_add`)
     /// across the boundary; the [`Profile`] aggregate holds none of
     /// its own.
-    fn resolve(&self) -> Result<Self::Resolved> {
+    fn resolve(&self, ctx: &ResolveContext) -> Result<Self::Resolved> {
         Ok(Profile {
-            mounts: self.mount_decls.resolve()?,
-            forwards: self.forward_decls.resolve()?,
-            env: self.env_decls.resolve()?,
+            mounts: self.mount_decls.resolve(ctx)?,
+            forwards: self.forward_decls.resolve(ctx)?,
+            env: self.env_decls.resolve(ctx)?,
         })
     }
 }
@@ -339,7 +341,8 @@ mod tests {
                 path_add: vec![OsString::from("/extra")],
             },
         };
-        let resolved = decl.resolve().expect("resolves");
+        let ctx = ResolveContext::empty();
+        let resolved = decl.resolve(&ctx).expect("resolves");
 
         // mounts: one entry, plus the readonly extra carried through.
         assert_eq!(resolved.mounts.iter().count(), 1);
@@ -365,6 +368,7 @@ mod tests {
         let mut left_env = EnvVars::default();
         left_env.set("SHARED", "left-wins-when-alone");
         left_env.set("ONLY_LEFT", "L");
+        let ctx = ResolveContext::empty();
         let left = Profile {
             mounts: MountDecls {
                 mounts: vec![MountDecl {
@@ -374,7 +378,7 @@ mod tests {
                 }],
                 readonly: Some(true),
             }
-            .resolve()
+            .resolve(&ctx)
             .expect("resolves"),
             forwards: ForwardDecls {
                 forwards: vec![ForwardDecl {
@@ -382,7 +386,7 @@ mod tests {
                     sandbox_port: None,
                 }],
             }
-            .resolve()
+            .resolve(&ctx)
             .expect("resolves"),
             env: left_env,
         };
@@ -399,7 +403,7 @@ mod tests {
                 }],
                 readonly: Some(false),
             }
-            .resolve()
+            .resolve(&ctx)
             .expect("resolves"),
             forwards: ForwardDecls {
                 forwards: vec![ForwardDecl {
@@ -407,7 +411,7 @@ mod tests {
                     sandbox_port: None,
                 }],
             }
-            .resolve()
+            .resolve(&ctx)
             .expect("resolves"),
             env: right_env,
         };
@@ -477,18 +481,19 @@ mod tests {
         // Build a Profile with extras populated in each sub-domain
         // that has them, call clear_extra_fields, and confirm each
         // is zeroed. (Forwards has no extras.)
+        let ctx = ResolveContext::empty();
         let mounts = MountDecls {
             mounts: Vec::new(),
             readonly: Some(true),
         }
-        .resolve()
+        .resolve(&ctx)
         .expect("resolves");
         let env = EnvVarDecls {
             env: Vec::new(),
             path: Some(OsString::from("/only/this")),
             path_add: vec![OsString::from("/extra")],
         }
-        .resolve()
+        .resolve(&ctx)
         .expect("resolves");
         let mut profile = Profile {
             mounts,
@@ -564,7 +569,8 @@ mod tests {
                 path_add: Vec::new(),
             },
         };
-        let final_ = decl.resolve().expect("resolves").finalize();
+        let ctx = ResolveContext::empty();
+        let final_ = decl.resolve(&ctx).expect("resolves").finalize();
 
         // System mount baseline present, user mount appended after.
         let usr_idx = final_
