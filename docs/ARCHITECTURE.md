@@ -1,6 +1,6 @@
 # redoubtful — v1 Architecture
 
-> **Status:** Original design. The core feature set is fairly settled; CLI details and code layout may still change quite a bit.
+> **Status:** Original design, as written up by Claude. The core feature set is fairly settled; CLI details and code layout may still change quite a bit.
 
 A single-binary Linux tool that runs coding agents (Claude Code, OpenCode, etc.) inside a tight sandbox with just enough host access to be useful.
 

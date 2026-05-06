@@ -1,6 +1,6 @@
 # WORK IN PROGRESS: `redoubtful`, a lightweight Linux agent sandbox
 
-_**WARNING:** This is incomplete work-in-progress, and nearly all of the code was written by Claude Opus 4.7. This is one of my "how good are agents this month?" projects._
+_**WARNING:** This is incomplete work-in-progress, and nearly all of the code was written by Claude Opus 4.7 and Qwen 3.6 27B. This is one of my "how good are agents this month?" projects._
 
 `redoubtful` is designed to be a lightweight agent sandbox that tries to make it semi-reasonable to use `--dangerously-skip-permissions`. It uses `pasta` and `bwrap` to:
 
@@ -15,20 +15,26 @@ This is _not_ trying to be a Docker container, or a browser-style security sandb
 
 - [x] Basic `pasta` configuration for locking down the network and mapping host ports into the sandbox.
 - [x] Basic `bwrap` configuration for locking down the rest of the environment.
-- [ ] Nice ergonomic configuration files.
+- [x] Nice ergonomic configuration files.
 - [ ] HTTPS proxy + credential storage.
 
 ## Usage
 
 You can run `opencode` in the sandbox using:
 
-```
+```sh
 redoubtful run \
     -m ~/.opencode -m ~/.config/opencode -p ~/.opencode/bin \
     -f 8080 opencode
 ```
 
 The `-f 8080` will map `localhost:8080` into the sandbox (for `llama-server`), and set up your mount points and paths to run `opencode`. Eventually it would be nice to offer named profiles so you didn't need to type all this.
+
+There are also "profiles." Take a look at `~/.config/redoubtful/config.toml`, which is created on first run. Make sure it correctly matches your `npm` and other tool locations. Then run:
+
+```sh
+redoubtful run -u pi pi
+```
 
 ## Installation (Linux)
 

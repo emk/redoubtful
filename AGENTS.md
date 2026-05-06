@@ -5,13 +5,14 @@
 ## Layout
 
 - `docs/`: Permanent reference docs, in Markdown.
-- `specs/`: Implementation specifications.
     - `ARCHITECTURE.md`: Original architecture notes.
+    - `SECURITY_PHILOSOPHY.md`: Overview of our security philosophy.
 - `plans/`: More emphemeral planning docs, in Markdown. Must have a "> **Status:**" line under the title.
 - `src/`:
     - `cmd/`: Command-line interface.
     - `config/`: Config file handing and share CLI argument types.
     - `prelude.rs`: Key imports used everywhere.
+    - `sandbox/`: Actual sandbox implementation.
 - `tests/`: Integration tests for the CLI interface.
     - `cli.rs`: Main integration test binary.
     - `fixtures/`: Files and directories needed to test.

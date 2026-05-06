@@ -1,6 +1,6 @@
 # Hardening: layered defense for the redoubtful sandbox
 
-> **Status:** Design notes from Claude, 2026-04-25. None of these layers are
+> **Status:** Design notes from Claude. None of these layers are
 > implemented in `redoubtful run` yet beyond what bwrap and pasta do
 > by default. This doc captures the layered model we want to build
 > toward; see [APPARMOR_USERNS.md](APPARMOR_USERNS.md) for the
