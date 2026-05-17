@@ -24,7 +24,7 @@ use super::{
     proxy::{Proxy, ProxyAction, ProxyDecl},
     resolve_context,
 };
-use crate::prelude::*;
+use crate::{hostname::Hostname, prelude::*};
 
 /// Shared proxy options.
 ///
@@ -89,7 +89,7 @@ pub struct Proxies {
     /// with a proper zero value (i.e. `None`).
     public_web: Option<ProxyAction>,
     /// Proxy entries keyed by hostname.
-    proxies: BTreeMap<String, Proxy>,
+    proxies: BTreeMap<Hostname, Proxy>,
 }
 
 impl Proxies {
@@ -130,7 +130,7 @@ impl Proxies {
     /// production code as `should_allow` covers Stage 3, but kept
     /// for future use.
     #[allow(dead_code)]
-    pub fn get(&self, host: &str) -> Option<&Proxy> {
+    pub fn get(&self, host: &Hostname) -> Option<&Proxy> {
         self.proxies.get(host)
     }
 
@@ -153,7 +153,7 @@ impl Proxies {
     /// This is the pure routing logic extracted from the handler
     /// so it can be unit-tested without constructing hudsucker's
     /// non-exhaustive `HttpContext`.
-    pub fn should_allow(&self, host: &str) -> bool {
+    pub fn should_allow(&self, host: &Hostname) -> bool {
         match self.proxies.get(host) {
             Some(proxy) => proxy.action == ProxyAction::Allow,
             None => match self.public_web {
@@ -213,6 +213,10 @@ impl Finalize for Proxies {
 mod tests {
     use super::*;
 
+    fn host(s: &str) -> Hostname {
+        s.parse().expect("valid hostname")
+    }
+
     // ===== ProxyDecls =====
 
     #[test]
@@ -227,7 +231,7 @@ mod tests {
         let decls = ProxyDecls {
             public_web: Some(ProxyAction::Deny),
             proxies: vec![ProxyDecl {
-                host: "example.net".to_owned(),
+                host: host("example.net"),
                 port: 443,
                 action: ProxyAction::Allow,
                 headers: BTreeMap::new(),
@@ -240,7 +244,7 @@ mod tests {
         assert_eq!(proxies.public_web().unwrap(), ProxyAction::Deny);
         assert!(!proxies.is_empty());
         let proxy = proxies.iter().next().unwrap();
-        assert_eq!(proxy.host, "example.net");
+        assert_eq!(proxy.host.as_ref(), "example.net");
     }
 
     // ===== Finalize =====
@@ -257,17 +261,17 @@ mod tests {
     fn proxies_merge_right_biased_deduplicates_by_host() {
         let mut left = Proxies::default();
         let left_proxy = Proxy {
-            host: "example.net".to_owned(),
+            host: host("example.net"),
             port: 443,
             action: ProxyAction::Allow,
             headers: BTreeMap::new(),
             params: BTreeMap::new(),
             auth: None,
         };
-        left.proxies.insert("example.net".to_owned(), left_proxy);
+        left.proxies.insert(host("example.net"), left_proxy);
 
         let right_proxy = Proxy {
-            host: "example.net".to_owned(),
+            host: host("example.net"),
             port: 80,
             action: ProxyAction::Deny,
             headers: BTreeMap::new(),
@@ -278,7 +282,7 @@ mod tests {
             public_web: Some(ProxyAction::Deny),
             proxies: {
                 let mut m = BTreeMap::new();
-                m.insert("example.net".to_owned(), right_proxy);
+                m.insert(host("example.net"), right_proxy);
                 m
             },
         };
@@ -286,7 +290,7 @@ mod tests {
         let merged = left.merge_right_biased(&right);
         assert_eq!(merged.public_web().unwrap(), ProxyAction::Deny);
         assert_eq!(merged.proxies.len(), 1);
-        let proxy = merged.proxies.get("example.net").unwrap();
+        let proxy = merged.proxies.get(&host("example.net")).unwrap();
         assert_eq!(proxy.action, ProxyAction::Deny);
         assert_eq!(proxy.port, 80);
     }
@@ -295,9 +299,9 @@ mod tests {
     fn proxies_merge_right_biased_concatenates_different_hosts() {
         let mut left = Proxies::default();
         left.proxies.insert(
-            "left.net".to_owned(),
+            host("left.net"),
             Proxy {
-                host: "left.net".to_owned(),
+                host: host("left.net"),
                 port: 443,
                 action: ProxyAction::Allow,
                 headers: BTreeMap::new(),
@@ -308,9 +312,9 @@ mod tests {
 
         let mut right = Proxies::default();
         right.proxies.insert(
-            "right.net".to_owned(),
+            host("right.net"),
             Proxy {
-                host: "right.net".to_owned(),
+                host: host("right.net"),
                 port: 443,
                 action: ProxyAction::Allow,
                 headers: BTreeMap::new(),
@@ -321,8 +325,8 @@ mod tests {
 
         let merged = left.merge_right_biased(&right);
         assert_eq!(merged.proxies.len(), 2);
-        assert!(merged.proxies.contains_key("left.net"));
-        assert!(merged.proxies.contains_key("right.net"));
+        assert!(merged.proxies.contains_key(&host("left.net")));
+        assert!(merged.proxies.contains_key(&host("right.net")));
     }
 
     // ===== get =====
@@ -331,9 +335,9 @@ mod tests {
     fn proxies_get_existing_host() {
         let mut proxies = Proxies::default();
         proxies.proxies.insert(
-            "example.net".to_owned(),
+            host("example.net"),
             Proxy {
-                host: "example.net".to_owned(),
+                host: host("example.net"),
                 port: 443,
                 action: ProxyAction::Allow,
                 headers: BTreeMap::new(),
@@ -341,22 +345,22 @@ mod tests {
                 auth: None,
             },
         );
-        assert!(proxies.get("example.net").is_some());
+        assert!(proxies.get(&host("example.net")).is_some());
     }
 
     #[test]
     fn proxies_get_missing_host() {
         let proxies = Proxies::default();
-        assert!(proxies.get("unknown.net").is_none());
+        assert!(proxies.get(&host("unknown.net")).is_none());
     }
 
     #[test]
-    fn proxies_get_case_sensitive() {
+    fn proxies_get_is_case_insensitive() {
         let mut proxies = Proxies::default();
         proxies.proxies.insert(
-            "example.net".to_owned(),
+            host("example.net"),
             Proxy {
-                host: "example.net".to_owned(),
+                host: host("example.net"),
                 port: 443,
                 action: ProxyAction::Allow,
                 headers: BTreeMap::new(),
@@ -364,8 +368,8 @@ mod tests {
                 auth: None,
             },
         );
-        // Caller must normalize — unnormalized lookup misses.
-        assert!(proxies.get("Example.Net").is_none());
+        // "Example.Net" normalizes to "example.net" → hits the entry.
+        assert!(proxies.get(&host("Example.Net")).is_some());
     }
 
     // ===== is_proxy_server_needed =====
@@ -396,9 +400,9 @@ mod tests {
             proxies: BTreeMap::new(),
         };
         proxies.proxies.insert(
-            "allowed.net".to_owned(),
+            host("allowed.net"),
             Proxy {
-                host: "allowed.net".to_owned(),
+                host: host("allowed.net"),
                 port: 443,
                 action: ProxyAction::Allow,
                 headers: BTreeMap::new(),
@@ -416,9 +420,9 @@ mod tests {
             proxies: BTreeMap::new(),
         };
         proxies.proxies.insert(
-            "denied.net".to_owned(),
+            host("denied.net"),
             Proxy {
-                host: "denied.net".to_owned(),
+                host: host("denied.net"),
                 port: 443,
                 action: ProxyAction::Deny,
                 headers: BTreeMap::new(),

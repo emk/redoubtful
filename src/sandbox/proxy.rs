@@ -52,7 +52,7 @@ use crate::{
         env_vars::EnvVars, forwards::Forwards, mounts::Mounts,
         profile::Profile, proxies::Proxies,
     },
-    hostname::normalize_hostname,
+    hostname::Hostname,
     prelude::*,
 };
 
@@ -221,10 +221,11 @@ impl HttpHandler for PassthroughHandler {
         _ctx: &HttpContext,
         req: &Request<Body>,
     ) -> bool {
-        let host = match req.uri().host() {
-            Some(h) => normalize_hostname(h),
-            None => return true, // no host → intercept and deny
-        };
+        let host =
+            match req.uri().host().and_then(|h| h.parse::<Hostname>().ok()) {
+                Some(host) => host,
+                None => return true, // no host or parse failure → intercept and deny
+            };
         // Invert: should_intercept = !should_allow
         !self.proxies.should_allow(&host)
     }
@@ -380,13 +381,17 @@ mod tests {
         action: crate::config::proxy::ProxyAction,
     ) -> crate::config::proxy::Proxy {
         crate::config::proxy::Proxy {
-            host: host.to_owned(),
+            host: host.parse().expect("valid hostname"),
             port: 443,
             action,
             headers: std::collections::BTreeMap::new(),
             params: std::collections::BTreeMap::new(),
             auth: None,
         }
+    }
+
+    fn host(s: &str) -> Hostname {
+        s.parse().expect("valid hostname")
     }
 
     #[test]
@@ -399,7 +404,7 @@ mod tests {
                 crate::config::proxy::ProxyAction::Allow,
             )],
         );
-        assert!(proxies.should_allow("example.net"));
+        assert!(proxies.should_allow(&host("example.net")));
     }
 
     #[test]
@@ -412,7 +417,7 @@ mod tests {
                 crate::config::proxy::ProxyAction::Deny,
             )],
         );
-        assert!(!proxies.should_allow("example.net"));
+        assert!(!proxies.should_allow(&host("example.net")));
     }
 
     #[test]
@@ -422,7 +427,7 @@ mod tests {
             Some(crate::config::proxy::ProxyAction::Allow),
             [],
         );
-        assert!(proxies.should_allow("unknown.net"));
+        assert!(proxies.should_allow(&host("unknown.net")));
     }
 
     #[test]
@@ -432,13 +437,13 @@ mod tests {
             Some(crate::config::proxy::ProxyAction::Deny),
             [],
         );
-        assert!(!proxies.should_allow("unknown.net"));
+        assert!(!proxies.should_allow(&host("unknown.net")));
     }
 
     #[test]
     fn should_deny_when_public_web_none() {
         // Unknown state → deny (safety default)
         let proxies = Proxies::with_entries(None, []);
-        assert!(!proxies.should_allow("anything.net"));
+        assert!(!proxies.should_allow(&host("anything.net")));
     }
 }

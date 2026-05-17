@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::{Secret, Template};
 use crate::{
     config::{Decl, resolve_context::ResolveContext},
+    hostname::Hostname,
     prelude::*,
 };
 
@@ -84,7 +85,7 @@ pub enum ProxyAuth {
 #[serde(deny_unknown_fields)]
 pub struct ProxyDecl {
     /// The hostname or IP address to proxy.
-    pub host: String,
+    pub host: Hostname,
     /// TCP port. Defaults to 443 (HTTPS).
     #[serde(default = "default_port")]
     pub port: u16,
@@ -147,11 +148,6 @@ impl FromStr for ProxyDecl {
             }
         };
 
-        // Validate host.
-        if host.is_empty() {
-            return Err(Error::ProxyEmptyHost);
-        }
-
         // Parse port if provided.
         let port = match port_str {
             Some(p) => p
@@ -166,8 +162,10 @@ impl FromStr for ProxyDecl {
             None => ProxyAction::Allow,
         };
 
+        let host = host.parse::<Hostname>()?;
+
         Ok(ProxyDecl {
-            host: host.to_owned(),
+            host,
             port,
             action,
             headers: BTreeMap::new(),
@@ -180,11 +178,11 @@ impl FromStr for ProxyDecl {
 impl Decl for ProxyDecl {
     type Resolved = Proxy;
 
-    /// Validate the proxy declaration. Rejects empty hostnames.
+    /// Validate the proxy declaration.
+    ///
+    /// Empty-host validation is already handled by [`Hostname::from_str`],
+    /// so this is a no-op.
     fn validate(&self) -> Result<()> {
-        if self.host.is_empty() {
-            return Err(Error::ProxyEmptyHost);
-        }
         Ok(())
     }
 
@@ -213,7 +211,7 @@ impl Decl for ProxyDecl {
             .transpose()?;
 
         Ok(Proxy {
-            host: crate::hostname::normalize_hostname(&self.host),
+            host: self.host.clone(),
             port: self.port,
             action: self.action,
             headers,
@@ -251,7 +249,7 @@ fn resolve_auth(
 #[derive(Debug, Clone)]
 pub struct Proxy {
     /// The hostname or IP address.
-    pub host: String,
+    pub host: Hostname,
     /// TCP port.
     pub port: u16,
     /// Whether to allow or deny traffic.
@@ -272,12 +270,16 @@ mod tests {
         s.parse()
     }
 
+    fn host(s: &str) -> Hostname {
+        s.parse().expect("valid hostname")
+    }
+
     // ===== FromStr =====
 
     #[test]
     fn proxy_decl_fromstr_host_only() {
         let decl = parse("example.net").expect("parses");
-        assert_eq!(decl.host, "example.net");
+        assert_eq!(decl.host.as_ref(), "example.net");
         assert_eq!(decl.port, 443);
         assert_eq!(decl.action, ProxyAction::Allow);
         assert!(decl.headers.is_empty());
@@ -288,7 +290,7 @@ mod tests {
     #[test]
     fn proxy_decl_fromstr_host_port() {
         let decl = parse("example.net:80").expect("parses");
-        assert_eq!(decl.host, "example.net");
+        assert_eq!(decl.host.as_ref(), "example.net");
         assert_eq!(decl.port, 80);
         assert_eq!(decl.action, ProxyAction::Allow);
     }
@@ -296,7 +298,7 @@ mod tests {
     #[test]
     fn proxy_decl_fromstr_host_action() {
         let decl = parse("example.net=deny").expect("parses");
-        assert_eq!(decl.host, "example.net");
+        assert_eq!(decl.host.as_ref(), "example.net");
         assert_eq!(decl.port, 443);
         assert_eq!(decl.action, ProxyAction::Deny);
     }
@@ -304,7 +306,7 @@ mod tests {
     #[test]
     fn proxy_decl_fromstr_full() {
         let decl = parse("example.net:80=deny").expect("parses");
-        assert_eq!(decl.host, "example.net");
+        assert_eq!(decl.host.as_ref(), "example.net");
         assert_eq!(decl.port, 80);
         assert_eq!(decl.action, ProxyAction::Deny);
     }
@@ -361,7 +363,7 @@ mod tests {
     fn proxy_decl_resolve_no_templates() {
         // Plain proxy with no templates — resolves without ctx usage.
         let decl = ProxyDecl {
-            host: "example.net".to_owned(),
+            host: host("example.net"),
             port: 443,
             action: ProxyAction::Allow,
             headers: BTreeMap::new(),
@@ -370,7 +372,7 @@ mod tests {
         };
         let ctx = ResolveContext::empty();
         let proxy = decl.resolve(&ctx).expect("resolves");
-        assert_eq!(proxy.host, "example.net");
+        assert_eq!(proxy.host.as_ref(), "example.net");
         assert_eq!(proxy.port, 443);
         assert_eq!(proxy.action, ProxyAction::Allow);
         assert!(proxy.headers.is_empty());
@@ -386,7 +388,7 @@ mod tests {
             Template("{{secrets.example.api-key}}".to_owned()),
         );
         let decl = ProxyDecl {
-            host: "example.net".to_owned(),
+            host: host("example.net"),
             port: 443,
             action: ProxyAction::Allow,
             headers,
@@ -403,7 +405,7 @@ mod tests {
     #[test]
     fn proxy_decl_resolve_renders_auth_basic() {
         let decl = ProxyDecl {
-            host: "example.net".to_owned(),
+            host: host("example.net"),
             port: 443,
             action: ProxyAction::Allow,
             headers: BTreeMap::new(),
@@ -421,7 +423,7 @@ mod tests {
     #[test]
     fn proxy_decl_resolve_renders_auth_bearer() {
         let decl = ProxyDecl {
-            host: "example.net".to_owned(),
+            host: host("example.net"),
             port: 443,
             action: ProxyAction::Allow,
             headers: BTreeMap::new(),
@@ -445,7 +447,7 @@ mod tests {
             Template("{{secrets.nonexistent.key}}".to_owned()),
         );
         let decl = ProxyDecl {
-            host: "example.net".to_owned(),
+            host: host("example.net"),
             port: 443,
             action: ProxyAction::Allow,
             headers: BTreeMap::new(),
@@ -458,18 +460,10 @@ mod tests {
     }
 
     #[test]
-    fn proxy_decl_resolve_normalizes_host_case() {
-        let decl = ProxyDecl {
-            host: "Example.Net".to_owned(),
-            port: 443,
-            action: ProxyAction::Allow,
-            headers: BTreeMap::new(),
-            params: BTreeMap::new(),
-            auth: None,
-        };
-        let ctx = ResolveContext::empty();
-        let proxy = decl.resolve(&ctx).expect("resolves");
-        assert_eq!(proxy.host, "example.net");
+    fn proxy_decl_fromstr_normalizes_host_case() {
+        // Normalization happens at parse time, not resolve time.
+        let decl = parse("Example.Net").expect("parses");
+        assert_eq!(decl.host.as_ref(), "example.net");
     }
 
     // ===== Secret redaction =====
