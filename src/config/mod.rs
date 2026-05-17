@@ -12,11 +12,10 @@
 
 use std::{
     ffi::OsStr,
+    fmt,
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
 };
-
-use std::fmt;
 
 use serde::{Deserialize, Serialize};
 

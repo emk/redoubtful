@@ -34,13 +34,15 @@
 //! into the sandbox. This is the cheapest way to satisfy the
 //! type-state without lying about our policy.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
-use hudsucker::hyper::{Response, StatusCode};
 use hudsucker::{
     Body, HttpContext, HttpHandler, Proxy,
-    certificate_authority::RcgenAuthority, hyper::Request,
+    certificate_authority::RcgenAuthority,
+    hyper::{Request, Response, StatusCode},
 };
 use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
@@ -233,7 +235,6 @@ impl HttpHandler for PassthroughHandler {
     /// At this point the CONNECT tunnel has been established (`200
     /// Connection established`), but the actual HTTP request is
     /// blocked here.
-
     async fn handle_request(
         &mut self,
         _ctx: &HttpContext,
