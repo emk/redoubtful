@@ -1,6 +1,6 @@
 # Proxy Configuration Sketch
 
-> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 still needs implementation.
+> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete.
 
 ## CLI Configuration
 
@@ -882,6 +882,365 @@ the proxy layer whether to intercept a given destination. The `Proxy`
 struct's `headers`, `params`, and `auth` fields carry the credential
 injection data needed by the proxy server's request rewriting logic.
 
-### Stage 3: Modify proxy server to support config
+### Stage 3: Modify proxy server to support passthrough config
 
-TODO: Plan
+**Scope:** Allow/deny routing based on `Proxies` config. Credential injection (headers, params, auth) deferred to Stage 4.
+
+#### Key design decisions
+
+1. **`start_proxy` takes `&Proxies`.** Signature becomes `async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle>`. It clones the `Proxies`, wraps the clone in `Arc`, and passes the `Arc` to the handler. `ProxyHandle` stays thin — no structural changes needed.
+
+2. **Deny via HTTP 403 after CONNECT.** Hudsucker's `should_intercept` controls MITM, not allow/deny. When `should_intercept` returns `false`, hudsucker tunnels the connection regardless. To deny a destination: return `true` from `should_intercept` (so we intercept), then in `handle_request` return an HTTP 403 response with a descriptive body and `Via` header. This matches real-world proxy convention: `200 Connection established` on CONNECT, then the actual request fails with 403.
+
+3. **Case-insensitive hostname matching.** `Proxies` is keyed by normalized hostname. A new `src/hostname.rs` module provides `normalize_hostname` (downcase for now, extensible for future security-related normalization). Called during `ProxyDecl::resolve` to normalize stored keys, and in the handler when looking up the target host.
+
+4. **`Arc<Proxies>` in the handler.** `TunnelOnlyHandler` becomes a small struct holding `Arc<Proxies>` (and `Arc<normalize_hostname>` if needed, or just a function reference). Hudsucker clones the handler per connection — cloning `Arc` is cheap.
+
+5. **`public_web` deny semantics.** When `public_web = Deny`, any host not explicitly in the proxy map is denied (same 403 path as above). When `public_web = Allow`, unknown hosts pass through as tunnels.
+
+6. **HTTP vs HTTPS — TBD.** Hudsucker calls itself an HTTP/S proxy and `handle_request` says "called for each HTTP request." We set both `HTTP_PROXY` and `HTTPS_PROXY` in the sandbox. We assume for now that hudsucker handles plain HTTP requests similarly (routed through the same handler), but **this needs investigation** — may require distinguishing CONNECT targets from Host-header-based routing in `handle_request`.
+
+#### Step 1: Create `src/hostname.rs` (new module)
+
+**File:** `src/hostname.rs` (new)
+
+```rust
+/// Normalize a hostname for use as a proxy key.
+///
+/// Currently just lowercases the string. Extensible for future
+/// security-related normalization (IDN punycode, trailing dots,
+/// etc.) without changing the public API or all call sites.
+pub fn normalize_hostname(host: &str) -> String {
+    host.to_lowercase()
+}
+```
+
+**Tests:**
+
+| Test | Covers |
+|------|--------|
+| `normalize_lowercase` | `"Example.Net"` → `"example.net"` |
+| `normalize_already_lowercase` | `"example.net"` → `"example.net"` (no-op) |
+| `normalize_mixed_case` | `"GITHUB.COM"` → `"github.com"` |
+| `normalize_with_port_stripped` | Caller's responsibility — this function does NOT strip ports |
+
+**File:** `src/lib.rs` — add `pub mod hostname;`.
+
+#### Step 2: Normalize hostnames in `ProxyDecl::resolve`
+
+**File:** `src/config/proxy.rs`
+
+In `impl Decl for ProxyDecl`, call `normalize_hostname` on `self.host`
+before storing in `Proxy`. This ensures all keys in the `Proxies`
+`BTreeMap` are lowercase.
+
+```rust
+// In ProxyDecl::resolve:
+fn resolve(&self, ctx: &ResolveContext) -> Result<Self::Resolved> {
+    // ... existing template resolution ...
+    Ok(Proxy {
+        host: crate::hostname::normalize_hostname(&self.host),
+        // ... rest unchanged ...
+    })
+}
+```
+
+**Tests in `src/config/proxy.rs`:** Update existing tests that assert
+on `proxy.host` to expect lowercase. Add one explicit test:
+
+| Test | Covers |
+|------|--------|
+| `proxy_decl_resolve_normalizes_host_case` | `"Example.Net"` → `"example.net"` in resolved `Proxy` |
+
+**Tests in `src/config/proxies.rs`:** Tests that construct `Proxy`
+manually already use lowercase hosts — no change needed. Tests that
+construct `ProxyDecl` then resolve should verify normalization.
+
+#### Step 3: Add `Proxies::get` for host lookup
+
+**File:** `src/config/proxies.rs`
+
+`proxies` field is currently private. Add a `get` method so the
+handler can look up a host:
+
+```rust
+/// Look up the proxy entry for a (presumably already-normalized)
+/// hostname. Returns `None` if the host is not explicitly configured.
+pub fn get(&self, host: &str) -> Option<&Proxy> {
+    self.proxies.get(host)
+}
+```
+
+Also add a `public_web` accessor that returns `ProxyAction` directly
+(rather than `Result<ProxyAction>`), since after finalization it's
+always `Some`. Or keep the existing `Result` API — either is fine.
+
+**Tests:**
+
+| Test | Covers |
+|------|--------|
+| `proxies_get_existing_host` | `get("example.net")` returns `Some` |
+| `proxies_get_missing_host` | `get("unknown.net")` returns `None` |
+| `proxies_get_case_sensitive` | `get("Example.Net")` returns `None` (caller must normalize) |
+
+#### Step 4: Replace `TunnelOnlyHandler` with `PassthroughHandler`
+
+**File:** `src/sandbox/proxy.rs`
+
+The current `TunnelOnlyHandler` is a unit struct that always returns
+`false` from `should_intercept`. Replace it with a handler that:
+- Holds `Arc<Proxies>`
+- In `should_intercept`, checks allow/deny and returns `true` for
+  denied hosts (so `handle_request` is called)
+- In `handle_request`, returns an HTTP 403 for denied hosts
+
+```rust
+use std::sync::Arc;
+
+use crate::{
+    hostname::normalize_hostname,
+    config::proxies::Proxies,
+};
+
+/// Proxy handler that enforces allow/deny rules from the
+/// [`Proxies`] config.
+///
+/// Allowed hosts: `should_intercept` returns `false` → pure CONNECT
+/// tunnel, raw bytes piped end-to-end (no MITM).
+///
+/// Denied hosts: `should_intercept` returns `true` → hudsucker
+/// intercepts the CONNECT, `handle_request` returns HTTP 403.
+/// The client sees `200 Connection established` on CONNECT, then
+/// the actual HTTP request fails with 403.
+///
+/// Credential injection (headers, params, auth) is deferred to
+/// Stage 4 — allowed hosts always tunnel in this stage.
+#[derive(Clone)]
+struct PassthroughHandler {
+    proxies: Arc<Proxies>,
+}
+
+impl HttpHandler for PassthroughHandler {
+    /// Decide whether to intercept (MITM) or tunnel.
+    ///
+    /// - Denied host → intercept (so we can return 403)
+    /// - Allowed host → tunnel (raw bytes, no interception)
+    async fn should_intercept(
+        &mut self,
+        _ctx: &HttpContext,
+        req: &Request<Body>,
+    ) -> bool {
+        let host = match req.uri().host() {
+            Some(h) => normalize_hostname(h),
+            None => return true, // no host → intercept and deny
+        };
+
+        match self.proxies.get(&host) {
+            Some(proxy) => {
+                // Explicitly configured host: deny if action is Deny
+                proxy.action == crate::config::proxy::ProxyAction::Deny
+            }
+            None => {
+                // Not in explicit list: follow public_web default
+                match self.proxies.public_web() {
+                    Ok(crate::config::proxy::ProxyAction::Allow) => false,
+                    Ok(crate::config::proxy::ProxyAction::Deny) => true,
+                    Err(_) => true, // safety: unknown state → deny
+                }
+            }
+        }
+    }
+
+    /// Return HTTP 403 for denied hosts.
+    ///
+    /// This is only called when `should_intercept` returned `true`.
+    /// At this point the CONNECT tunnel has been established (`200
+    /// Connection established`), but the actual HTTP request is
+    /// blocked here.
+    async fn handle_request(
+        &mut self,
+        _ctx: &HttpContext,
+        req: Request<Body>,
+    ) -> hudsucker::RequestOrResponse {
+        let host = req.uri().host().unwrap_or("unknown");
+        trace!(host, "denied request");
+
+        let response = hyper::Response::builder()
+            .status(hyper::StatusCode::FORBIDDEN)
+            .header("Via", "1.1 redoubtful-proxy")
+            .body(Body::from(format!(
+                "Access to {} is denied by redoubtful proxy configuration.\n",
+                host
+            )))
+            .expect("403 response builds");
+
+        hudsucker::RequestOrResponse::Response(response)
+    }
+}
+```
+
+**Design notes:**
+
+- `req.uri().host()` extracts the target hostname from the request URI.
+  For CONNECT requests, this is the `CONNECT host:port` authority. For
+  intercepted HTTPS, this is the `Host` header / URI authority.
+- If `host()` returns `None` (malformed URI), we intercept and deny
+  as a safety default.
+- `normalize_hostname` is called on the request host before lookup,
+  matching the normalization applied during `ProxyDecl::resolve`.
+- The `handle_request` default impl returns `RequestOrResponse::Request`
+  (forward to upstream). We override it to return `Response` (short-circuit)
+  for denied requests.
+- `trace!` for denied requests helps diagnose allow/deny decisions.
+
+#### Step 5: Update `start_proxy` to accept `&Proxies`
+
+**File:** `src/sandbox/proxy.rs`
+
+Change the signature:
+
+```rust
+// Before:
+pub async fn start_proxy() -> Result<ProxyHandle>
+
+// After:
+pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle>
+```
+
+Inside `start_proxy`, clone and wrap in `Arc`:
+
+```rust
+let proxies = Arc::new(proxies.clone());
+
+let proxy = Proxy::builder()
+    // ... unchanged ...  
+    .with_http_handler(PassthroughHandler {
+        proxies: proxies.clone(),
+    })
+    // ... unchanged ...
+```
+
+#### Step 6: Update `cmd_run` call site
+
+**File:** `src/cmd/run.rs`
+
+Pass `&user_profile.proxies` to `start_proxy`:
+
+```rust
+// Before:
+let proxy_handle = start_proxy().await?;
+
+// After:
+let proxy_handle = start_proxy(&user_profile.proxies).await?;
+```
+
+Remove the `proxies: _` dead-code discard:
+
+```rust
+// Before:
+let Profile {
+    mounts,
+    forwards,
+    env,
+    proxies: _,
+} = profile_with_proxy;
+
+// After:
+let Profile {
+    mounts,
+    forwards,
+    env,
+    proxies: _proxies, // passed to start_proxy above
+} = profile_with_proxy;
+```
+
+Or better, don't destructure `proxies` at all since it's only used
+for `start_proxy`:
+
+```rust
+let Profile {
+    mounts,
+    forwards,
+    env,
+    ..
+} = profile_with_proxy;
+```
+
+#### Step 7: Update `proxy_profile` (no change needed)
+
+`proxy_profile` returns a `Profile` with `Proxies::default()` and
+contributes env vars + port forward. This is unchanged — the actual
+`Proxies` config comes from the user's profile, not the proxy profile.
+The merge ensures proxy env vars take precedence.
+
+#### Step 8: Update the proxy smoke test
+
+**File:** `src/sandbox/proxy.rs`
+
+```rust
+#[tokio::test]
+async fn start_proxy_binds_a_port_and_shuts_down_cleanly() {
+    let proxies = Proxies::default();
+    let handle = start_proxy(&proxies).await.expect("proxy starts");
+    assert!(handle.port > 0, "ephemeral port assigned");
+    handle.shutdown().await;
+}
+```
+
+#### Step 9: Add handler unit tests
+
+**File:** `src/sandbox/proxy.rs`
+
+Add tests for `should_intercept` logic:
+
+| Test | Setup | Assert |
+|------|-------|--------|
+| `should_intercept_allows_explicit_allow` | public_web=Deny, explicit Allow for `example.net` | `false` (tunnel) |
+| `should_intercept_denies_explicit_deny` | public_web=Allow, explicit Deny for `example.net` | `true` (intercept) |
+| `should_intercept_allows_unknown_when_public_allow` | public_web=Allow, host not in map | `false` (tunnel) |
+| `should_intercept_denies_unknown_when_public_deny` | public_web=Deny, host not in map | `true` (intercept) |
+| `should_intercept_case_insensitive` | `example.net` in map, request for `Example.Net` | matches (normalized) |
+| `should_intercept_denies_no_host` | URI with no host | `true` (safety default) |
+
+Tests construct a `PassthroughHandler` with a pre-populated `Proxies`
+and call `should_intercept` directly with a constructed
+`Request<Body>`.
+
+#### Step 10: Update the module doc
+
+**File:** `src/sandbox/proxy.rs`
+
+Update the module-level doc comment from "Stage 1: tunnel-only" to
+reflect that the proxy now supports allow/deny configuration.
+
+#### Summary of files touched
+
+| File | Action |
+|------|-------|
+| `src/lib.rs` | Add `pub mod hostname;` |
+| `src/hostname.rs` | **New** — `normalize_hostname` function |
+| `src/config/proxy.rs` | Normalize host in `resolve`, add test |
+| `src/config/proxies.rs` | Add `get` method + tests |
+| `src/sandbox/proxy.rs` | Replace handler, update `start_proxy` sig, update test |
+| `src/cmd/run.rs` | Pass `&user_profile.proxies` to `start_proxy` |
+
+**Total: ~6 files (1 new, 5 modified).**
+
+**Expected risk level:** Low-moderate. The `normalize_hostname` and
+`Proxies::get` additions are purely additive. The handler replacement
+is the riskiest part — it changes the default behavior from "always
+tunnel" to "check config first". The `should_intercept` logic is
+straightforward branching, well-tested by unit tests. The `handle_request`
+override is only exercised for denied hosts (explicit deny or
+public_web=Deny + unknown host).
+
+**Integration with Stage 4:** Stage 4 will modify `should_intercept`
+to return `true` for hosts that need credential injection (so
+`handle_request` can rewrite headers/params/auth), and `handle_request`
+will forward the modified request instead of returning 403. The
+`normalize_hostname` function will be used to extract and normalize
+hosts from both CONNECT and intercepted HTTP requests.
+
+### Stage 4: Modify proxy server to support credential injection
+
+TODO: Plan.

@@ -1,4 +1,4 @@
-//! Stage 1: a tunnel-only HTTPS proxy on host loopback.
+//! A proxy server with allow/deny configuration on host loopback.
 //!
 //! The sandbox cannot resolve DNS or reach external network on its
 //! own (`specs/ARCHITECTURE.md`, "No DNS resolution to arbitrary
@@ -10,12 +10,18 @@
 //! that upstream. TLS terminates end-to-end between the client and
 //! the real server — the proxy never sees plaintext.
 //!
-//! Stage 1 deliberately does **not** intercept (no MITM, no
-//! credential injection, no allow/deny). The architecture spec's
-//! "MITM mode" lands later; for now the only goal is "make
-//! HTTPS-proxy-aware clients in the sandbox able to reach the
-//! internet at all" so things like `pi`'s `npm install` no longer
-//! die on `getaddrinfo EAI_AGAIN`.
+//! **Allow/deny routing.** The [`PassthroughHandler`] consults the
+//! [`Proxies`] config for each request:
+//!
+//! - Allowed hosts: `should_intercept` returns `false` → pure CONNECT
+//!   tunnel, raw bytes piped end-to-end (no MITM).
+//! - Denied hosts: `should_intercept` returns `true` → hudsucker
+//!   intercepts the CONNECT, `handle_request` returns HTTP 403.
+//!   The client sees `200 Connection established` on CONNECT, then
+//!   the actual HTTP request fails with 403.
+//!
+//! Credential injection (headers, params, auth) is deferred to
+//! Stage 4 — allowed hosts always tunnel in this stage.
 //!
 //! Why a CA shows up below despite no MITM. Hudsucker's typed
 //! builder requires `with_ca` to leave the `WantsCa` state — the
@@ -29,7 +35,9 @@
 //! type-state without lying about our policy.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
+use hudsucker::hyper::{Response, StatusCode};
 use hudsucker::{
     Body, HttpContext, HttpHandler, Proxy,
     certificate_authority::RcgenAuthority, hyper::Request,
@@ -42,6 +50,7 @@ use crate::{
         env_vars::EnvVars, forwards::Forwards, mounts::Mounts,
         profile::Profile, proxies::Proxies,
     },
+    hostname::normalize_hostname,
     prelude::*,
 };
 
@@ -77,7 +86,7 @@ impl ProxyHandle {
     }
 }
 
-/// Bind a host-loopback port, spawn the tunnel-only proxy on it,
+/// Bind a host-loopback port, spawn the proxy on it,
 /// and return a handle the launcher can use to query the port and
 /// shut the proxy down on exit.
 ///
@@ -86,7 +95,7 @@ impl ProxyHandle {
 /// netns (see `crate::pasta`), so a sandboxed client doing
 /// `connect("127.0.0.1", port)` lands on this listener.
 #[instrument(level = "debug", skip_all)]
-pub async fn start_proxy() -> Result<ProxyHandle> {
+pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
     let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -96,6 +105,10 @@ pub async fn start_proxy() -> Result<ProxyHandle> {
         .map_err(|e| Error::could_not_run("read proxy local_addr", e))?
         .port();
     debug!(port, "proxy listener bound");
+
+    // Clone and wrap in Arc so the handler can share the config
+    // across connections without contention.
+    let proxies = Arc::new(proxies.clone());
 
     // Throwaway CA — see module doc for why it exists. Generated
     // fresh per process; the keypair never leaves this address space.
@@ -115,7 +128,9 @@ pub async fn start_proxy() -> Result<ProxyHandle> {
         .with_listener(listener)
         .with_ca(ca)
         .with_rustls_connector(provider)
-        .with_http_handler(TunnelOnlyHandler)
+        .with_http_handler(PassthroughHandler {
+            proxies: proxies.clone(),
+        })
         .with_graceful_shutdown(async move {
             // A `Sender::send` we never receive (because the launcher
             // exited without calling `shutdown`) cancels via the
@@ -173,28 +188,72 @@ fn build_throwaway_ca() -> Result<Issuer<'static, KeyPair>> {
     Ok(Issuer::new(params, key_pair))
 }
 
-/// Hudsucker handler that vetoes interception for every CONNECT,
-/// turning the proxy into a pure CONNECT-tunnel: client TLS goes
-/// end-to-end to the real upstream, the proxy just pipes bytes.
+/// Proxy handler that enforces allow/deny rules from the
+/// [`Proxies`] config.
+///
+/// Allowed hosts: `should_intercept` returns `false` → pure CONNECT
+/// tunnel, raw bytes piped end-to-end (no MITM).
+///
+/// Denied hosts: `should_intercept` returns `true` → hudsucker
+/// intercepts the CONNECT, `handle_request` returns HTTP 403.
+/// The client sees `200 Connection established` on CONNECT, then
+/// the actual HTTP request fails with 403.
+///
+/// Credential injection (headers, params, auth) is deferred to
+/// Stage 4 — allowed hosts always tunnel in this stage.
 ///
 /// `Clone` because hudsucker clones the handler per connection.
-/// Stateless, so cloning is free.
+/// Cloning `Arc` is cheap.
 #[derive(Clone)]
-struct TunnelOnlyHandler;
+struct PassthroughHandler {
+    proxies: Arc<Proxies>,
+}
 
-impl HttpHandler for TunnelOnlyHandler {
-    /// Returning `false` short-circuits hudsucker's MITM path: the
-    /// CONNECT response is `200 Connection established` and the rest
-    /// of the connection is `tokio::io::copy_bidirectional` between
-    /// the client socket and a fresh outbound TCP to the upstream.
-    /// `handle_request` / `handle_response` are never called in this
-    /// mode, so we keep their default impls.
+impl HttpHandler for PassthroughHandler {
+    /// Decide whether to intercept (MITM) or tunnel.
+    ///
+    /// - Denied host → intercept (so we can return 403)
+    /// - Allowed host → tunnel (raw bytes, no interception)
     async fn should_intercept(
         &mut self,
         _ctx: &HttpContext,
-        _req: &Request<Body>,
+        req: &Request<Body>,
     ) -> bool {
-        false
+        let host = match req.uri().host() {
+            Some(h) => normalize_hostname(h),
+            None => return true, // no host → intercept and deny
+        };
+        // Invert: should_intercept = !should_allow
+        !self.proxies.should_allow(&host)
+    }
+
+    /// Return HTTP 403 for denied hosts.
+    ///
+    /// This is only called when `should_intercept` returned `true`.
+    /// At this point the CONNECT tunnel has been established (`200
+    /// Connection established`), but the actual HTTP request is
+    /// blocked here.
+
+    async fn handle_request(
+        &mut self,
+        _ctx: &HttpContext,
+        req: Request<Body>,
+    ) -> hudsucker::RequestOrResponse {
+        let host = req.uri().host().unwrap_or("unknown");
+        trace!(host, "denied request");
+
+        // This should always build successfully.
+        #[allow(clippy::expect_used)]
+        let response = Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("Via", "1.1 redoubtful-proxy")
+            .body(Body::from(format!(
+                "Access to {} is denied by redoubtful proxy configuration.\n",
+                host
+            )))
+            .expect("403 response builds");
+
+        hudsucker::RequestOrResponse::Response(response)
     }
 }
 
@@ -303,8 +362,82 @@ mod tests {
         // hanging. Doesn't exercise an actual CONNECT (that would
         // require an upstream and is a bwrap+pasta integration
         // concern, not a unit-level one).
-        let handle = start_proxy().await.expect("proxy starts");
+        let proxies = Proxies::default();
+        let handle = start_proxy(&proxies).await.expect("proxy starts");
         assert!(handle.port > 0, "ephemeral port assigned");
         handle.shutdown().await;
+    }
+
+    // ===== should_allow routing tests =====
+    //
+    // These test `Proxies::should_allow` directly — the pure routing
+    // logic extracted from the handler. This avoids needing to
+    // construct hudsucker's non-exhaustive `HttpContext`.
+
+    fn mk_proxy(
+        host: &str,
+        action: crate::config::proxy::ProxyAction,
+    ) -> crate::config::proxy::Proxy {
+        crate::config::proxy::Proxy {
+            host: host.to_owned(),
+            port: 443,
+            action,
+            headers: std::collections::BTreeMap::new(),
+            params: std::collections::BTreeMap::new(),
+            auth: None,
+        }
+    }
+
+    #[test]
+    fn should_allow_explicit_allow() {
+        // public_web=Deny, explicit Allow for example.net
+        let proxies = Proxies::with_entries(
+            Some(crate::config::proxy::ProxyAction::Deny),
+            [mk_proxy(
+                "example.net",
+                crate::config::proxy::ProxyAction::Allow,
+            )],
+        );
+        assert!(proxies.should_allow("example.net"));
+    }
+
+    #[test]
+    fn should_deny_explicit_deny() {
+        // public_web=Allow, explicit Deny for example.net
+        let proxies = Proxies::with_entries(
+            Some(crate::config::proxy::ProxyAction::Allow),
+            [mk_proxy(
+                "example.net",
+                crate::config::proxy::ProxyAction::Deny,
+            )],
+        );
+        assert!(!proxies.should_allow("example.net"));
+    }
+
+    #[test]
+    fn should_allow_unknown_when_public_allow() {
+        // public_web=Allow, host not in map
+        let proxies = Proxies::with_entries(
+            Some(crate::config::proxy::ProxyAction::Allow),
+            [],
+        );
+        assert!(proxies.should_allow("unknown.net"));
+    }
+
+    #[test]
+    fn should_deny_unknown_when_public_deny() {
+        // public_web=Deny, host not in map
+        let proxies = Proxies::with_entries(
+            Some(crate::config::proxy::ProxyAction::Deny),
+            [],
+        );
+        assert!(!proxies.should_allow("unknown.net"));
+    }
+
+    #[test]
+    fn should_deny_when_public_web_none() {
+        // Unknown state → deny (safety default)
+        let proxies = Proxies::with_entries(None, []);
+        assert!(!proxies.should_allow("anything.net"));
     }
 }

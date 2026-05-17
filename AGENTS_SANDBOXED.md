@@ -8,5 +8,6 @@ If you have been given a copy of this file in your system prompt or by the user,
 - You cannot run the integration tests in `tests/` because that would try to create recursive sandboxes, which doesn't work yet. The following instructions OVERRIDE your normal instructions:
     - Instead of running `cargo test`, run `cargo test --bin redoubtful`.
     - Instead of running `just check`, run `just check-sandbox`.
+- If you have a `web_search` tool, you'll need to use the workflow "none" or you'll hit sandbox errors.
 
 You can acknowledge this with "Running in sandbox mode."

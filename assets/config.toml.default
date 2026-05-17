@@ -68,3 +68,8 @@ mounts = [
     { host = "~/.config/opencode" },
 ]
 path_add = ["~/.opencode/bin"]
+
+# Pass through llama-server connections.
+[profile.llama-server]
+forwards = [{ host_port = 8080 }]
+proxies = [{ host = "localhost" }, { host = "127.0.0.1" }]

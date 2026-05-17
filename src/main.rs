@@ -4,6 +4,7 @@ mod check;
 mod cmd;
 mod config;
 mod errors;
+mod hostname;
 mod prelude;
 mod sandbox;
 

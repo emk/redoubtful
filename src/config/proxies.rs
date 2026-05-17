@@ -93,6 +93,23 @@ pub struct Proxies {
 }
 
 impl Proxies {
+    /// Construct a `Proxies` from a public_web action and an iterator
+    /// of proxies. Used by the resolve path and by tests.
+    #[cfg(test)]
+    pub(crate) fn with_entries(
+        public_web: Option<ProxyAction>,
+        entries: impl IntoIterator<Item = Proxy>,
+    ) -> Self {
+        let mut proxies = BTreeMap::new();
+        for p in entries {
+            proxies.insert(p.host.clone(), p);
+        }
+        Self {
+            public_web,
+            proxies,
+        }
+    }
+
     /// Iterate over the proxy entries.
     #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = &Proxy> {
@@ -105,12 +122,46 @@ impl Proxies {
         self.proxies.is_empty()
     }
 
+    /// Look up the proxy entry for a (presumably already-normalized)
+    /// hostname. Returns `None` if the host is not explicitly configured.
+    ///
+    /// Used by the proxy server handler for host lookup, and by
+    /// Stage 4 for credential injection. Currently unused in
+    /// production code as `should_allow` covers Stage 3, but kept
+    /// for future use.
+    #[allow(dead_code)]
+    pub fn get(&self, host: &str) -> Option<&Proxy> {
+        self.proxies.get(host)
+    }
+
     /// Returns the number of proxy entries.
     #[allow(dead_code)]
     pub fn public_web(&self) -> Result<ProxyAction> {
         self.public_web.ok_or_else(|| {
             todo!("should be set by base_config; needs new error type")
         })
+    }
+
+    /// Check whether traffic to a (presumably already-normalized)
+    /// hostname should be allowed (not intercepted).
+    ///
+    /// - Explicit allow → `true` (tunnel)
+    /// - Explicit deny → `false` (intercept → 403)
+    /// - Not in map → follows `public_web` default
+    /// - Unknown state → `false` (safety: deny)
+    ///
+    /// This is the pure routing logic extracted from the handler
+    /// so it can be unit-tested without constructing hudsucker's
+    /// non-exhaustive `HttpContext`.
+    pub fn should_allow(&self, host: &str) -> bool {
+        match self.proxies.get(host) {
+            Some(proxy) => proxy.action == ProxyAction::Allow,
+            None => match self.public_web {
+                Some(ProxyAction::Allow) => true,
+                Some(ProxyAction::Deny) => false,
+                None => false, // safety: unknown state → deny
+            },
+        }
     }
 
     /// Whether a proxy server process is needed at all.
@@ -272,6 +323,49 @@ mod tests {
         assert_eq!(merged.proxies.len(), 2);
         assert!(merged.proxies.contains_key("left.net"));
         assert!(merged.proxies.contains_key("right.net"));
+    }
+
+    // ===== get =====
+
+    #[test]
+    fn proxies_get_existing_host() {
+        let mut proxies = Proxies::default();
+        proxies.proxies.insert(
+            "example.net".to_owned(),
+            Proxy {
+                host: "example.net".to_owned(),
+                port: 443,
+                action: ProxyAction::Allow,
+                headers: BTreeMap::new(),
+                params: BTreeMap::new(),
+                auth: None,
+            },
+        );
+        assert!(proxies.get("example.net").is_some());
+    }
+
+    #[test]
+    fn proxies_get_missing_host() {
+        let proxies = Proxies::default();
+        assert!(proxies.get("unknown.net").is_none());
+    }
+
+    #[test]
+    fn proxies_get_case_sensitive() {
+        let mut proxies = Proxies::default();
+        proxies.proxies.insert(
+            "example.net".to_owned(),
+            Proxy {
+                host: "example.net".to_owned(),
+                port: 443,
+                action: ProxyAction::Allow,
+                headers: BTreeMap::new(),
+                params: BTreeMap::new(),
+                auth: None,
+            },
+        );
+        // Caller must normalize — unnormalized lookup misses.
+        assert!(proxies.get("Example.Net").is_none());
     }
 
     // ===== is_proxy_server_needed =====

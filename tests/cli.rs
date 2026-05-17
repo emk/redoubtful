@@ -1216,3 +1216,47 @@ fn second_run_does_not_re_emit_first_run_notice() {
         "second run must not re-emit init notice: {stderr}",
     );
 }
+
+// ===== Proxy configuration (Stage 3: allow/deny routing) =====
+//
+// These tests verify that proxy CLI flags parse and accept values
+// without error. The actual allow/deny routing is exercised by
+// the unit tests in `sandbox::proxy` (which test `Proxies::should_allow`
+// directly). Integration tests here only cover CLI wiring.
+
+/// `--public-web=deny` is accepted by the CLI. Verifies the flag
+/// parses and merges into the profile without crashing.
+#[test]
+fn proxy_public_web_deny_flag_is_accepted() {
+    cmd()
+        .args(["run", "--public-web=deny", "/bin/true"])
+        .assert()
+        .success();
+}
+
+/// `--proxy=HOST[:PORT][=ACTION]` is accepted by the CLI. Verifies
+/// the compact proxy syntax parses without error.
+#[test]
+fn proxy_flag_accepts_compact_syntax() {
+    // Full form: host:port=action
+    cmd()
+        .args(["run", "--proxy=example.net:80=deny", "/bin/true"])
+        .assert()
+        .success();
+}
+
+/// Invalid proxy syntax produces a clear error.
+#[test]
+fn proxy_flag_rejects_invalid_syntax() {
+    let out = cmd()
+        .args(["run", "--proxy=bad=host=action", "/bin/true"])
+        .output()
+        .expect("run");
+    assert!(!out.status.success(), "expected failure: {out:?}");
+    let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("invalid")
+            || stderr.contains("multiple `=` separators"),
+        "stderr should mention the syntax error: {stderr}",
+    );
+}

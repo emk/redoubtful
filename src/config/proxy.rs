@@ -213,7 +213,7 @@ impl Decl for ProxyDecl {
             .transpose()?;
 
         Ok(Proxy {
-            host: self.host.clone(),
+            host: crate::hostname::normalize_hostname(&self.host),
             port: self.port,
             action: self.action,
             headers,
@@ -455,6 +455,21 @@ mod tests {
         let ctx = ResolveContext::empty();
         let err = decl.resolve(&ctx).expect_err("missing secret must error");
         assert!(matches!(err, Error::TemplateRender { .. }));
+    }
+
+    #[test]
+    fn proxy_decl_resolve_normalizes_host_case() {
+        let decl = ProxyDecl {
+            host: "Example.Net".to_owned(),
+            port: 443,
+            action: ProxyAction::Allow,
+            headers: BTreeMap::new(),
+            params: BTreeMap::new(),
+            auth: None,
+        };
+        let ctx = ResolveContext::empty();
+        let proxy = decl.resolve(&ctx).expect("resolves");
+        assert_eq!(proxy.host, "example.net");
     }
 
     // ===== Secret redaction =====

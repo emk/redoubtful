@@ -115,7 +115,7 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     // operation). Right-biased merge means proxy env vars win on any
     // key collision, which is correct: the user shouldn't be able to
     // break the proxy by setting `HTTPS_PROXY` to something else.
-    let proxy_handle = start_proxy().await?;
+    let proxy_handle = start_proxy(&user_profile.proxies).await?;
     debug!(port = proxy_handle.port, "credential proxy listening");
     let profile_with_proxy =
         user_profile.merge_right_biased(&proxy_profile(proxy_handle.port));
@@ -124,7 +124,7 @@ pub async fn cmd_run(args: Args) -> Result<()> {
         mounts,
         forwards,
         env,
-        proxies: _,
+        ..
     } = profile_with_proxy;
 
     // ----- Assemble bwrap and pasta argvs -----
