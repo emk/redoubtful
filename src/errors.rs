@@ -183,15 +183,15 @@ pub enum Error {
         reason: String,
     },
 
-    /// Could not write the embedded default config to its
-    /// expected location during the first-run dump. Permission
-    /// denied, parent dir not creatable, read-only home, etc. We
-    /// surface the OS error directly rather than letting it bubble
-    /// up as a vaguer "I/O failed" — the user often needs to do
+    /// Could not write a configuration or secrets file during
+    /// auto-init or other file operations. Permission denied,
+    /// parent dir not creatable, read-only home, etc. We surface
+    /// the OS error directly rather than letting it bubble up as
+    /// a vaguer "I/O failed" — the user often needs to do
     /// something specific (chmod, mkdir, mount the home volume rw)
     /// to unstick this.
-    #[error("could not write config file `{}`", path.display())]
-    CouldNotWriteConfig {
+    #[error("could not write file `{}`", path.display())]
+    CouldNotWriteFile {
         /// The path we tried to write.
         path: PathBuf,
 
@@ -200,12 +200,12 @@ pub enum Error {
         source: io::Error,
     },
 
-    /// Could not read the user's TOML config file.
+    /// Could not read a configuration or secrets file.
     /// Distinguished from a parse error so missing-file vs
     /// permission-denied vs malformed-syntax all surface
     /// independently in the diagnostic.
-    #[error("could not read config file `{}`", path.display())]
-    CouldNotReadConfig {
+    #[error("could not read file `{}`", path.display())]
+    CouldNotReadFile {
         /// The path we tried to read.
         path: PathBuf,
 
@@ -252,36 +252,6 @@ pub enum Error {
         name: String,
         /// Path to the config file we resolved against.
         config_path: PathBuf,
-    },
-
-    /// Could not read the secrets file.
-    #[error("could not read secrets file `{}`", path.display())]
-    CouldNotReadSecrets {
-        /// The path we tried to read.
-        path: PathBuf,
-        /// The underlying I/O error.
-        #[source]
-        source: io::Error,
-    },
-
-    /// Could not parse the secrets file.
-    #[error("could not parse secrets file `{}`", path.display())]
-    CouldNotParseSecrets {
-        /// The path we tried to parse.
-        path: PathBuf,
-        /// The underlying parse error.
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    /// Could not write the default secrets file during auto-init.
-    #[error("could not write secrets file `{}`", path.display())]
-    CouldNotWriteSecrets {
-        /// The path we tried to write.
-        path: PathBuf,
-        /// The underlying I/O error.
-        #[source]
-        source: io::Error,
     },
 
     /// A Handlebars template failed to render. This includes
@@ -331,8 +301,9 @@ pub enum Error {
 /// is what we want). Carries the file content (as a
 /// `NamedSource<String>` so miette renders the file name in the
 /// underline) and an optional byte span pulled from the toml crate.
+/// Used for any TOML file that goes through the shared `LoadOrInitFile` trait.
 #[derive(Debug, Diagnostic, thiserror::Error)]
-#[error("invalid config in `{}`: {message}", path.display())]
+#[error("invalid TOML in `{}`: {message}", path.display())]
 pub struct ConfigParseError {
     /// The path that failed to parse — surfaced in the message so
     /// the user can find the file even if the span pointer gets
@@ -437,14 +408,14 @@ impl Error {
         Self::InvalidEnvName { name, reason }
     }
 
-    /// Create an [`Error::CouldNotReadConfig`].
-    pub fn could_not_read_config(path: PathBuf, source: io::Error) -> Self {
-        Self::CouldNotReadConfig { path, source }
+    /// Create an [`Error::CouldNotReadFile`].
+    pub fn could_not_read_file(path: PathBuf, source: io::Error) -> Self {
+        Self::CouldNotReadFile { path, source }
     }
 
-    /// Create an [`Error::CouldNotWriteConfig`].
-    pub fn could_not_write_config(path: PathBuf, source: io::Error) -> Self {
-        Self::CouldNotWriteConfig { path, source }
+    /// Create an [`Error::CouldNotWriteFile`].
+    pub fn could_not_write_file(path: PathBuf, source: io::Error) -> Self {
+        Self::CouldNotWriteFile { path, source }
     }
 
     /// Create an [`Error::ConfigInvalidPath`].
@@ -503,24 +474,6 @@ impl Error {
             span,
             message: e.message().to_owned(),
         }))
-    }
-
-    /// Create an [`Error::CouldNotReadSecrets`].
-    pub fn could_not_read_secrets(path: PathBuf, source: io::Error) -> Self {
-        Self::CouldNotReadSecrets { path, source }
-    }
-
-    /// Create an [`Error::CouldNotParseSecrets`].
-    pub fn could_not_parse_secrets(
-        path: PathBuf,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    ) -> Self {
-        Self::CouldNotParseSecrets { path, source }
-    }
-
-    /// Create an [`Error::CouldNotWriteSecrets`].
-    pub fn could_not_write_secrets(path: PathBuf, source: io::Error) -> Self {
-        Self::CouldNotWriteSecrets { path, source }
     }
 
     /// Create an [`Error::TemplateRender`].

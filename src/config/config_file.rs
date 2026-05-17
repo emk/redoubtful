@@ -5,8 +5,12 @@
 //! catches typos at the file level so a stray top-level key is
 //! rejected instead of silently landing in a catch-all.
 //!
-//! [`ConfigFile::load_or_init`] reads the file (or, on first run,
-//! drops [`DEFAULT_CONFIG`] onto disk and re-reads it).
+//! [`LoadOrInitFile`] is the shared trait for reading a TOML file
+//! and auto-writing an embedded default when the file is missing.
+//! [`ConfigFile`] and [`SecretsFile`](super::resolve_context::SecretsFile)
+//! both implement it, so the read → NotFound → write-default → re-read
+//! → parse flow lives in one place.
+//!
 //! [`ConfigFile::finalize_config_with_cli`] runs the full pipeline
 //! `cmd_run` and `cmd_show` share: load → normalize `~/`-prefixed
 //! paths → resolve the `uses` chain → validate every profile (both
@@ -40,6 +44,55 @@ use super::{
 };
 use crate::prelude::*;
 
+/// Trait for files that auto-create from an embedded default on first run.
+///
+/// Both [`ConfigFile`] and [`SecretsFile`](super::resolve_context::SecretsFile)
+/// implement this. The shared `load_or_init` flow is:
+///
+/// 1. Read the file from `path`.
+/// 2. If `NotFound`, write [`Self::default_content`] to disk and re-read.
+/// 3. Parse via `toml::from_str::<Self>`.
+///
+/// This keeps the read → NotFound → write-default → re-read → parse
+/// logic in one place while each file type provides only its default content.
+pub trait LoadOrInitFile: Sized + for<'de> Deserialize<'de> {
+    /// The embedded default text, dropped onto disk byte-for-byte on first run.
+    fn default_content() -> &'static str;
+
+    /// Load the file, auto-initializing from the embedded default if missing.
+    fn load_or_init(path: &Path) -> Result<Self> {
+        match fs::read_to_string(path) {
+            Ok(source) => toml::from_str::<Self>(&source).map_err(|e| {
+                Error::config_parse(path.to_path_buf(), source, &e)
+            }),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                write_default(path, Self::default_content())?;
+                // Re-read from disk rather than using the embedded constant —
+                // keeps a single source of truth for what the resolver sees.
+                let source = fs::read_to_string(path).map_err(|e| {
+                    Error::could_not_read_file(path.to_path_buf(), e)
+                })?;
+                toml::from_str::<Self>(&source).map_err(|e| {
+                    Error::config_parse(path.to_path_buf(), source, &e)
+                })
+            }
+            Err(e) => Err(Error::could_not_read_file(path.to_path_buf(), e)),
+        }
+    }
+}
+
+/// Write `content` to `path`, creating parent dirs if needed.
+fn write_default(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| Error::could_not_write_file(path.to_path_buf(), e))?;
+    }
+    fs::write(path, content)
+        .map_err(|e| Error::could_not_write_file(path.to_path_buf(), e))?;
+    debug!("redoubtful: wrote default file to {}", path.display());
+    Ok(())
+}
+
 /// Parsed `~/.config/redoubtful/config.toml`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,43 +112,29 @@ pub struct ConfigFile {
 pub const DEFAULT_CONFIG: &str =
     include_str!("../../assets/config.toml.default");
 
-impl ConfigFile {
-    /// Load the user's config, auto-initializing the embedded default
-    /// when the file is missing.
-    ///
-    /// On first run the file at `path` doesn't exist; we write the
-    /// embedded asset and emit a one-line stderr notice naming the
-    /// file. Subsequent runs hit the existing-file path and behave
-    /// like a plain read-and-parse. An *empty* file (e.g. after the
-    /// user manually `truncate -s 0`'d it) is honored as "no profiles
-    /// defined" — we don't re-init over user-edited state.
-    ///
-    /// Permission-denied / read-only-home / any other I/O error besides
-    /// `NotFound` still propagates as [`Error::CouldNotReadConfig`].
-    /// Failures during the auto-init write (parent-dir creation, the
-    /// write itself) propagate as [`Error::CouldNotWriteConfig`] so the
-    /// user can tell apart "I can't read your config" from "I tried
-    /// to install one and couldn't."
-    pub fn load_or_init(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(source) => parse_config(&source, path),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                init_default_config(path)?;
-                // Re-parse the just-written file rather than the
-                // embedded constant — keeps a single source of truth
-                // (`fs::read_to_string`) for what the resolver sees,
-                // and means the embedded-vs-on-disk byte mismatch (if
-                // it ever existed) would surface as a parse divergence
-                // here rather than silently.
-                let source = fs::read_to_string(path).map_err(|e| {
-                    Error::could_not_read_config(path.to_path_buf(), e)
-                })?;
-                parse_config(&source, path)
-            }
-            Err(e) => Err(Error::could_not_read_config(path.to_path_buf(), e)),
-        }
+/// Load the user's config, auto-initializing the embedded default
+/// when the file is missing.
+///
+/// On first run the file at `path` doesn't exist; we write the
+/// embedded asset and emit a one-line stderr notice naming the
+/// file. Subsequent runs hit the existing-file path and behave
+/// like a plain read-and-parse. An *empty* file (e.g. after the
+/// user manually `truncate -s 0`'d it) is honored as "no profiles
+/// defined" — we don't re-init over user-edited state.
+///
+/// Permission-denied / read-only-home / any other I/O error besides
+/// `NotFound` still propagates as [`Error::CouldNotReadFile`].
+/// Failures during the auto-init write (parent-dir creation, the
+/// write itself) propagate as [`Error::CouldNotWriteFile`] so the
+/// user can tell apart "I can't read your config" from "I tried
+/// to install one and couldn't."
+impl LoadOrInitFile for ConfigFile {
+    fn default_content() -> &'static str {
+        DEFAULT_CONFIG
     }
+}
 
+impl ConfigFile {
     /// Load the user's config, resolve the user's `uses` chain, fold
     /// in the CLI's [`ProfileDecl`] as the last layer, and finalize.
     /// Returns a fully-baked [`Profile`] ready for argv construction.
@@ -155,26 +194,6 @@ impl ConfigFile {
         chain.push(cli.resolve(ctx)?);
         Ok(Profile::merge_all_right_biased(&chain).finalize())
     }
-}
-
-/// Write [`DEFAULT_CONFIG`] to `path`, creating the parent dir
-/// (including intermediate XDG layers) if needed. Emits a one-line
-/// stderr notice naming the file so the user knows *something* just
-/// happened in their home directory — a silent file creation would
-/// be a usability bug.
-fn init_default_config(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            Error::could_not_write_config(path.to_path_buf(), e)
-        })?;
-    }
-    fs::write(path, DEFAULT_CONFIG)
-        .map_err(|e| Error::could_not_write_config(path.to_path_buf(), e))?;
-    // `eprintln!` (not `info!`) for the notice: tracing-subscriber
-    // adds a level/timestamp prefix unsuitable for a one-shot
-    // user-facing message about a side effect they didn't ask for.
-    debug!("redoubtful: wrote default config to {}", path.display());
-    Ok(())
 }
 
 /// Resolve `requested` profile names against `config` via
@@ -239,17 +258,6 @@ fn resolve_uses_helper<'a>(
     Ok(())
 }
 
-/// Parse `source` as a [`ConfigFile`], attaching `path` and the
-/// source text to any error so miette can render the byte span as
-/// an underline. Separated from [`load_or_init`] so unit tests can
-/// exercise the parse-error surface without going through the
-/// filesystem.
-pub(super) fn parse_config(source: &str, path: &Path) -> Result<ConfigFile> {
-    toml::from_str::<ConfigFile>(source).map_err(|e| {
-        Error::config_parse(path.to_path_buf(), source.to_owned(), &e)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -264,7 +272,13 @@ mod tests {
     /// that the underlying source slice at the span lines up with
     /// what the user would see underlined.
     fn parse(source: &str) -> Result<ConfigFile> {
-        parse_config(source, Path::new("test.toml"))
+        toml::from_str(source).map_err(|e| {
+            Error::config_parse(
+                Path::new("test.toml").to_path_buf(),
+                source.to_owned(),
+                &e,
+            )
+        })
     }
 
     /// Pull the byte slice the miette span points at, or `None`
@@ -726,9 +740,8 @@ uses = ["a"]
         // `assets/config.toml.default` would let us release a
         // binary that breaks every user's first run. This test
         // catches that before it ships.
-        let cfg =
-            parse_config(DEFAULT_CONFIG, Path::new("config.toml.default"))
-                .expect("embedded default must parse");
+        let cfg = toml::from_str::<ConfigFile>(DEFAULT_CONFIG)
+            .expect("embedded default must parse");
         assert!(cfg.profile_decls.contains_key("opencode"));
     }
 }

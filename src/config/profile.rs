@@ -292,7 +292,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::config_file::{DEFAULT_CONFIG, parse_config};
+    use crate::config::config_file::{ConfigFile, DEFAULT_CONFIG};
 
     #[test]
     fn embedded_default_config_normalizes_paths_against_a_fake_home() {
@@ -303,9 +303,8 @@ mod tests {
         // install" regression. Also serves as integration coverage
         // that `ProfileDecl::normalize_config_paths` correctly
         // delegates to its `MountDecls` and `EnvVarDecls` children.
-        let mut cfg =
-            parse_config(DEFAULT_CONFIG, Path::new("config.toml.default"))
-                .expect("parses");
+        let mut cfg: ConfigFile =
+            toml::from_str(DEFAULT_CONFIG).expect("parses");
         for profile in cfg.profile_decls.values_mut() {
             profile
                 .normalize_config_paths(Path::new("/home/test"))

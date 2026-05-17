@@ -1154,8 +1154,8 @@ fn run_with_broken_config_surfaces_error_even_without_profile_arg() {
     assert!(!out.status.success(), "expected failure: {out:?}");
     let stderr = std::str::from_utf8(&out.stderr).expect("utf-8");
     assert!(
-        stderr.contains("invalid config"),
-        "stderr should call out invalid config: {stderr}",
+        stderr.contains("invalid TOML"),
+        "stderr should call out invalid TOML: {stderr}",
     );
 }
 
