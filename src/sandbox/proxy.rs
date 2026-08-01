@@ -1,7 +1,7 @@
 //! A proxy server with allow/deny configuration on host loopback.
 //!
 //! The sandbox cannot resolve DNS or reach external network on its
-//! own (`specs/ARCHITECTURE.md`, "No DNS resolution to arbitrary
+//! own (`docs/ARCHITECTURE.md`, "No DNS resolution to arbitrary
 //! hosts"); proxying through the host is the only path out. This
 //! module owns the host-side proxy: it binds an ephemeral port on
 //! `127.0.0.1`, accepts the `CONNECT host:port` requests sandboxed
@@ -10,32 +10,31 @@
 //! that upstream. TLS terminates end-to-end between the client and
 //! the real server — the proxy never sees plaintext.
 //!
-//! **Allow/deny routing.** The [`PassthroughHandler`] consults the
-//! [`Proxies`] config for each request:
+//! **Allow/deny routing.** hudsucker calls
+//! [`PassthroughHandler::handle_request`] as the gateway for *every*
+//! request (HTTP and CONNECT alike, before any upstream is touched), so
+//! that is where routing lives. It consults the [`Proxies`] config:
 //!
-//! - Allowed hosts: `should_intercept` returns `false` → pure CONNECT
-//!   tunnel, raw bytes piped end-to-end (no MITM).
-//! - Denied hosts: `should_intercept` returns `true` → hudsucker
-//!   intercepts the CONNECT, `handle_request` returns HTTP 403.
-//!   The client sees `200 Connection established` on CONNECT, then
-//!   the actual HTTP request fails with 403.
+//! - Allowed hosts: the request is returned unchanged → plain HTTP is
+//!   forwarded upstream; CONNECT streams are tunneled raw (no MITM).
+//! - Denied hosts: an HTTP 403 `Response` is returned, short-circuiting
+//!   the request before it reaches any upstream.
 //!
 //! Credential injection (headers, params, auth) is deferred to
 //! Stage 4 — allowed hosts always tunnel in this stage.
 //!
-//! Why a CA shows up below despite no MITM. Hudsucker's typed
-//! builder requires `with_ca` to leave the `WantsCa` state — the
-//! API doesn't model "tunnel-only, no CA" as a valid configuration
-//! even though it is a valid runtime mode (`HttpHandler::should_intercept`
-//! returning `false` short-circuits CONNECT before the CA is touched).
-//! We therefore generate a throwaway in-memory CA at startup, hand
-//! it to the builder, and never let it sign anything: no cert is
-//! written to disk, no env var points at one, nothing is bind-mounted
-//! into the sandbox. This is the cheapest way to satisfy the
-//! type-state without lying about our policy.
+//! **Certificate authority.** Hudsucker's builder requires `with_ca`
+//! to leave the `WantsCa` state. We generate a fresh per-session CA
+//! with `rcgen`, pass the [`Issuer`] to hudsucker for leaf cert
+//! signing, and persist the CA's self-signed certificate to a
+//! [`NamedTempFile`] owned by [`ProxyHandle`]. The launcher reads the
+//! path via [`ProxyHandle::ca_cert_path`] to bind-mount the cert into
+//! the sandbox, and sets CA-bundle env vars so sandboxed tools trust
+//! it.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
+    path::Path,
     sync::Arc,
 };
 
@@ -45,6 +44,7 @@ use hudsucker::{
     hyper::{Request, Response, StatusCode},
 };
 use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
+use tempfile::NamedTempFile;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use crate::{
@@ -61,16 +61,33 @@ use crate::{
 /// Held by `cmd_run` for the lifetime of the sandbox; on shutdown
 /// the caller invokes [`Self::shutdown`] to signal the proxy to
 /// stop accepting and to drain in-flight tunnels.
+///
+/// Owns the per-session CA certificate as a [`NamedTempFile`] so it
+/// is cleaned up when the handle is dropped.
 pub struct ProxyHandle {
     /// Host-loopback port the proxy is listening on. Pasta forwards
     /// this into the sandbox's netns; bwrap sets `HTTPS_PROXY` to
     /// `http://127.0.0.1:<port>`.
     pub port: u16,
+    /// Per-session CA certificate. Lives on disk so the launcher can
+    /// bind-mount it into the sandbox. Auto-deleted on drop.
+    ca_cert: NamedTempFile,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
 
 impl ProxyHandle {
+    /// Path to the CA certificate PEM file.
+    ///
+    /// The launcher bind-mounts this into the sandbox (e.g.
+    /// `/etc/ssl/certs/sandbox-ca.pem`) and sets CA-bundle env vars
+    /// (`SSL_CERT_FILE`, `GIT_SSL_CAINFO`, etc.) so sandboxed tools
+    /// trust it.
+    #[expect(dead_code, reason = "consumed by launcher once MITM is wired")]
+    pub fn ca_cert_path(&self) -> &Path {
+        self.ca_cert.path()
+    }
+
     /// Signal the proxy to stop and wait for its task to finish.
     ///
     /// Best-effort: if the task already exited (e.g. the listener
@@ -101,10 +118,10 @@ pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
     let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
     let listener = TcpListener::bind(bind_addr)
         .await
-        .map_err(|e| Error::could_not_run("bind proxy listener", e))?;
+        .map_err(|e| Error::other("could not bind proxy listener", e))?;
     let port = listener
         .local_addr()
-        .map_err(|e| Error::could_not_run("read proxy local_addr", e))?
+        .map_err(|e| Error::other("could not read proxy local_addr", e))?
         .port();
     debug!(port, "proxy listener bound");
 
@@ -112,9 +129,21 @@ pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
     // across connections without contention.
     let proxies = Arc::new(proxies.clone());
 
-    // Throwaway CA — see module doc for why it exists. Generated
-    // fresh per process; the keypair never leaves this address space.
-    let issuer = build_throwaway_ca()?;
+    // Log what routing config actually reached the proxy: `public_web`
+    // and `(host, port, action)` per entry. Deliberately no headers,
+    // params, or auth (those may hold secrets).
+    let (public_web, entries) = proxies.routing_summary();
+    debug!(?public_web, entries = ?entries, "proxy routing config");
+
+    // Per-session CA: issuer goes to hudsucker for leaf cert signing,
+    // PEM cert goes to a temp file so the launcher can bind-mount it
+    // into the sandbox.
+    let (issuer, ca_cert_pem) = build_throwaway_ca()?;
+    let ca_cert = NamedTempFile::new()
+        .map_err(|e| Error::other("could not create CA cert temp file", e))?;
+    std::fs::write(ca_cert.path(), &ca_cert_pem)
+        .map_err(|e| Error::other("could not write CA cert to temp file", e))?;
+    debug!(ca_cert = ?ca_cert.path(), "CA cert persisted");
 
     // Pure-Rust crypto for hudsucker's TLS layers. In tunnel-only
     // mode the provider isn't actually exercised on the proxy's
@@ -142,8 +171,8 @@ pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
         })
         .build()
         .map_err(|e| {
-            Error::could_not_run(
-                "build proxy",
+            Error::other(
+                "could not build proxy",
                 std::io::Error::other(e.to_string()),
             )
         })?;
@@ -156,24 +185,26 @@ pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
 
     Ok(ProxyHandle {
         port,
+        ca_cert,
         shutdown_tx: Some(shutdown_tx),
         task,
     })
 }
 
-/// Generate the throwaway CA hudsucker's builder demands. See the
-/// module doc for why this exists; the short version is that the
-/// builder's type-state requires `with_ca` to compile, and we want
-/// to satisfy it without lying — this CA is real, just unused.
+/// Generate the per-session CA for the proxy.
 ///
-/// `is_ca = Unconstrained` so the cert is *technically* a valid CA
-/// in case a future change flips a single host to MITM mode and
-/// hudsucker's leaf-signing path actually fires; it costs nothing
-/// to set correctly today and it matches what we'd need then.
-fn build_throwaway_ca() -> Result<Issuer<'static, KeyPair>> {
+/// Returns the [`Issuer`] (for hudsucker's leaf cert signing) and
+/// the PEM-encoded self-signed CA certificate (for the launcher to
+/// bind-mount into the sandbox).
+///
+/// `is_ca = Unconstrained` so the cert is a valid CA for signing
+/// leaf certificates. The CA cert is written to a [`NamedTempFile`
+/// (`tempfile::NamedTempFile`)] in [`start_proxy`] and auto-cleaned
+/// when [`ProxyHandle`] is dropped.
+fn build_throwaway_ca() -> Result<(Issuer<'static, KeyPair>, String)> {
     let key_pair = KeyPair::generate().map_err(|e| {
-        Error::could_not_run(
-            "generate proxy CA keypair",
+        Error::other(
+            "could not generate proxy CA keypair",
             std::io::Error::other(e.to_string()),
         )
     })?;
@@ -181,82 +212,117 @@ fn build_throwaway_ca() -> Result<Issuer<'static, KeyPair>> {
     let mut params = CertificateParams::default();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let mut dn = DistinguishedName::new();
-    dn.push(
-        DnType::CommonName,
-        "redoubtful sandbox proxy (unused — tunnel-only)",
-    );
+    dn.push(DnType::CommonName, "redoubtful sandbox proxy CA");
     params.distinguished_name = dn;
 
-    Ok(Issuer::new(params, key_pair))
+    // Generate the self-signed CA cert before consuming `params`
+    // into the `Issuer`. `Issuer::new` takes ownership of params
+    // and extracts only the DN and key usages — it doesn't store
+    // the certificate.
+    let ca_cert_pem = params
+        .self_signed(&key_pair)
+        .map_err(|e| {
+            Error::other(
+                "could not generate proxy CA self-signed cert",
+                std::io::Error::other(e.to_string()),
+            )
+        })?
+        .pem();
+
+    // Rebuild params for the Issuer. We only set is_ca, dn, and
+    // the rest are defaults, so this is cheap and explicit.
+    let mut params = CertificateParams::default();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "redoubtful sandbox proxy CA");
+    params.distinguished_name = dn;
+    let issuer = Issuer::new(params, key_pair);
+
+    Ok((issuer, ca_cert_pem))
 }
 
 /// Proxy handler that enforces allow/deny rules from the
 /// [`Proxies`] config.
 ///
-/// Allowed hosts: `should_intercept` returns `false` → pure CONNECT
-/// tunnel, raw bytes piped end-to-end (no MITM).
+/// hudsucker calls [`PassthroughHandler::handle_request`] as the
+/// gateway for every request (HTTP and CONNECT alike), so that's where
+/// allow/deny routing lives:
 ///
-/// Denied hosts: `should_intercept` returns `true` → hudsucker
-/// intercepts the CONNECT, `handle_request` returns HTTP 403.
-/// The client sees `200 Connection established` on CONNECT, then
-/// the actual HTTP request fails with 403.
+/// - Allowed hosts: the request is returned unchanged → plain HTTP is
+///   forwarded upstream, CONNECT streams are tunneled raw (no MITM).
+/// - Denied hosts: an HTTP 403 `Response` is returned, short-circuiting
+///   the request before it reaches any upstream.
 ///
 /// Credential injection (headers, params, auth) is deferred to
 /// Stage 4 — allowed hosts always tunnel in this stage.
 ///
-/// `Clone` because hudsucker clones the handler per connection.
-/// Cloning `Arc` is cheap.
+/// `should_intercept` is never consulted for routing — it only gates
+/// MITM on CONNECT, which Stage 3 does not do. `Clone` because
+/// hudsucker clones the handler per connection; cloning `Arc` is cheap.
 #[derive(Clone)]
 struct PassthroughHandler {
     proxies: Arc<Proxies>,
 }
 
 impl HttpHandler for PassthroughHandler {
-    /// Decide whether to intercept (MITM) or tunnel.
+    /// Decide whether to MITM a CONNECT stream.
     ///
-    /// - Denied host → intercept (so we can return 403)
-    /// - Allowed host → tunnel (raw bytes, no interception)
+    /// Stage 3 is tunnel-only: allowed CONNECT hosts are piped raw
+    /// bytes end-to-end and never intercepted, so this returns `false`
+    /// unconditionally. Stage 4 (credential injection) will flip this
+    /// per-host to enable MITM.
     async fn should_intercept(
         &mut self,
         _ctx: &HttpContext,
-        req: &Request<Body>,
+        _req: &Request<Body>,
     ) -> bool {
-        let host =
-            match req.uri().host().and_then(|h| h.parse::<Hostname>().ok()) {
-                Some(host) => host,
-                None => return true, // no host or parse failure → intercept and deny
-            };
-        // Invert: should_intercept = !should_allow
-        !self.proxies.should_allow(&host)
+        false
     }
 
-    /// Return HTTP 403 for denied hosts.
+    /// Gateway for every request (HTTP and CONNECT). Routes based on
+    /// the [`Proxies`] config:
     ///
-    /// This is only called when `should_intercept` returned `true`.
-    /// At this point the CONNECT tunnel has been established (`200
-    /// Connection established`), but the actual HTTP request is
-    /// blocked here.
+    /// - Allowed host → return `Request` so hudsucker tunnels/forwards.
+    /// - Denied host → return the 403 `Response`, short-circuiting it.
     async fn handle_request(
         &mut self,
         _ctx: &HttpContext,
         req: Request<Body>,
     ) -> hudsucker::RequestOrResponse {
         let host = req.uri().host().unwrap_or("unknown");
+        let hostname =
+            match req.uri().host().and_then(|h| h.parse::<Hostname>().ok()) {
+                Some(h) => h,
+                None => {
+                    // No host or parse failure → deny. Log so we can spot
+                    // extraction problems (e.g. a port or trailing dot
+                    // leaking into the hostname).
+                    trace!(host, "unparseable host; denying");
+                    return hudsucker::RequestOrResponse::Response(
+                        deny_response(host),
+                    );
+                }
+            };
+        if self.proxies.should_allow(&hostname) {
+            trace!(host = %host, "routing: forwarding/tunneling allowed host");
+            return hudsucker::RequestOrResponse::Request(req);
+        }
         trace!(host, "denied request");
-
-        // This should always build successfully.
-        #[allow(clippy::expect_used)]
-        let response = Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .header("Via", "1.1 redoubtful-proxy")
-            .body(Body::from(format!(
-                "Access to {} is denied by redoubtful proxy configuration.\n",
-                host
-            )))
-            .expect("403 response builds");
-
-        hudsucker::RequestOrResponse::Response(response)
+        hudsucker::RequestOrResponse::Response(deny_response(host))
     }
+}
+
+/// Build the HTTP 403 deny response for a host.
+fn deny_response(host: &str) -> Response<Body> {
+    // This should always build successfully.
+    #[allow(clippy::expect_used)]
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("Via", "1.1 redoubtful-proxy")
+        .body(Body::from(format!(
+            "Access to {host} is denied by redoubtful proxy configuration.\n"
+        )))
+        .expect("403 response builds")
 }
 
 /// Construct the proxy env-var inventory.
@@ -266,10 +332,9 @@ impl HttpHandler for PassthroughHandler {
 /// adding `WSS_PROXY` if we ever speak WebSocket directly, dropping
 /// `ALL_PROXY` if it causes trouble — is one edit in one file.
 ///
-/// `NO_PROXY=""` is set explicitly even though `--clearenv` already
-/// drops the host's value: it nails the policy down at the bwrap
-/// layer rather than relying on absence-as-policy, and a future
-/// reader sees the rule rather than having to infer it.
+/// `NO_PROXY` is set explicitly even though `--clearenv` already
+/// drops the host's value. Whatever we ultimately set here (empty,
+/// localhost, etc.) should be a matter of policy.
 pub fn proxy_env_vars(port: u16) -> EnvVars {
     let url = format!("http://127.0.0.1:{port}");
     let mut env = EnvVars::default();
@@ -279,8 +344,8 @@ pub fn proxy_env_vars(port: u16) -> EnvVars {
     env.set("http_proxy", &url);
     env.set("ALL_PROXY", &url);
     env.set("all_proxy", &url);
-    env.set("NO_PROXY", "");
-    env.set("no_proxy", "");
+    env.set("NO_PROXY", "localhost,127.0.0.1");
+    env.set("no_proxy", "localhost,127.0.0.1");
     env
 }
 
@@ -347,14 +412,19 @@ mod tests {
             assert_eq!(&entry.value, expected, "{name} value");
         }
 
-        // NO_PROXY family is empty — explicit-empty policy at the
-        // bwrap layer (see `proxy_env_vars` doc).
+        // NO_PROXY exempts loopback so proxy-bypassing traffic (e.g. a
+        // local model server) never enters the proxy (see `proxy_env_vars`
+        // doc).
         for name in ["NO_PROXY", "no_proxy"] {
             let entry = env
                 .iter()
                 .find(|e| e.name == name)
                 .unwrap_or_else(|| panic!("{name} missing"));
-            assert_eq!(&entry.value, OsStr::new(""), "{name} value");
+            assert_eq!(
+                &entry.value,
+                OsStr::new("localhost,127.0.0.1"),
+                "{name} value"
+            );
         }
     }
 

@@ -48,6 +48,17 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// Could not install a signal handler.
+    #[error("could install signal handler for {signal}")]
+    CouldNotInstallSignalHandler {
+        /// The signal name.
+        signal: String,
+
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
+
     /// Missing dependency. The message stays terse so the
     /// preflight report's per-check remediation can vary
     /// independently — see `check::probe_remediation`, which owns
@@ -290,6 +301,17 @@ pub enum Error {
         /// Why we rejected it.
         reason: String,
     },
+
+    /// Another type of error.
+    #[error("{message}")]
+    Other {
+        /// The error message.
+        message: String,
+
+        /// The underlying I/O error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 }
 
 /// Boxed payload for [`Error::ConfigParse`].
@@ -350,6 +372,17 @@ impl Error {
     ) -> Self {
         Self::CouldNotRun {
             command: command.into(),
+            source,
+        }
+    }
+
+    /// Create an [`Error::CouldNotInstallSignalHandler`].
+    pub fn could_not_install_signal_handler(
+        signal: &str,
+        source: io::Error,
+    ) -> Self {
+        Self::CouldNotInstallSignalHandler {
+            signal: signal.to_owned(),
             source,
         }
     }
@@ -495,5 +528,16 @@ impl Error {
     /// Create an [`Error::ProxyInvalidSyntax`].
     pub fn proxy_invalid_syntax(spec: String, reason: String) -> Self {
         Self::ProxyInvalidSyntax { spec, reason }
+    }
+
+    /// Create an [`Error::Other`].
+    pub fn other(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Other {
+            message: message.into(),
+            source: Box::new(source),
+        }
     }
 }

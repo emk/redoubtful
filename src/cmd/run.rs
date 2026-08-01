@@ -198,10 +198,9 @@ pub async fn cmd_run(args: Args) -> Result<()> {
     // directly. `start_kill` sends SIGKILL — this is a hard exit;
     // graceful shutdown is a follow-up if it ever matters.
     let mut sigint = signal(SignalKind::interrupt())
-        .map_err(|e| Error::could_not_run("install SIGINT handler", e))?;
+        .map_err(|e| Error::could_not_install_signal_handler("SIGINT", e))?;
     let mut sigterm = signal(SignalKind::terminate())
-        .map_err(|e| Error::could_not_run("install SIGTERM handler", e))?;
-
+        .map_err(|e| Error::could_not_install_signal_handler("SIGTERM", e))?;
     let status = loop {
         tokio::select! {
             res = child.wait() => {

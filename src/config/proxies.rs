@@ -142,6 +142,23 @@ impl Proxies {
         })
     }
 
+    /// Route-relevant summary for diagnostics.
+    ///
+    /// Returns `public_web` plus one `(host, port, action)` triple per
+    /// configured entry. Deliberately excludes `headers`, `params`, and
+    /// `auth`, which may hold secrets — so this value is always safe to
+    /// log.
+    pub fn routing_summary(
+        &self,
+    ) -> (Option<ProxyAction>, Vec<(Hostname, u16, ProxyAction)>) {
+        let entries = self
+            .proxies
+            .iter()
+            .map(|(host, p)| (host.clone(), p.port, p.action))
+            .collect();
+        (self.public_web, entries)
+    }
+
     /// Check whether traffic to a (presumably already-normalized)
     /// hostname should be allowed (not intercepted).
     ///
@@ -370,6 +387,80 @@ mod tests {
         );
         // "Example.Net" normalizes to "example.net" → hits the entry.
         assert!(proxies.get(&host("Example.Net")).is_some());
+    }
+
+    // ===== routing_summary =====
+
+    #[test]
+    fn routing_summary_reports_public_web_and_routing_triples() {
+        let mut proxies = Proxies {
+            public_web: Some(ProxyAction::Allow),
+            proxies: BTreeMap::new(),
+        };
+        proxies.proxies.insert(
+            host("prometheus.lan"),
+            Proxy {
+                host: host("prometheus.lan"),
+                port: 8080,
+                action: ProxyAction::Allow,
+                headers: BTreeMap::new(),
+                params: BTreeMap::new(),
+                auth: None,
+            },
+        );
+
+        let (public_web, entries) = proxies.routing_summary();
+        assert_eq!(public_web, Some(ProxyAction::Allow));
+        assert_eq!(entries.len(), 1);
+        let (h, port, action) = &entries[0];
+        assert_eq!(h.as_ref(), "prometheus.lan");
+        assert_eq!(*port, 8080);
+        assert_eq!(*action, ProxyAction::Allow);
+    }
+
+    #[test]
+    fn routing_summary_never_exposes_secret_values() {
+        use crate::config::{Secret, proxy::ProxyAuth};
+
+        // A proxy with filled-in headers/params/auth. Raw secret strings
+        // must never appear in the Debug form of `routing_summary`.
+        let mut proxies = Proxies::default();
+        proxies.proxies.insert(
+            host("prometheus.lan"),
+            Proxy {
+                host: host("prometheus.lan"),
+                port: 8080,
+                action: ProxyAction::Allow,
+                headers: BTreeMap::from([(
+                    "X-Api-Key".into(),
+                    Secret("super-secret-header".into()),
+                )]),
+                params: BTreeMap::from([(
+                    "api_key".into(),
+                    Secret("super-secret-param".into()),
+                )]),
+                auth: Some(ProxyAuth::Bearer {
+                    token: Secret("super-secret-token".into()),
+                }),
+            },
+        );
+
+        let summary = proxies.routing_summary();
+        let rendered = format!("{summary:?}");
+        // Routing fields are present...
+        assert!(rendered.contains("prometheus.lan"));
+        assert!(rendered.contains("8080"));
+        // ...but no secret value leaks into the log surface.
+        for secret in [
+            "super-secret-header",
+            "super-secret-param",
+            "super-secret-token",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "secret leaked into log output: {secret}"
+            );
+        }
     }
 
     // ===== is_proxy_server_needed =====

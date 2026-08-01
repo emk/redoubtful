@@ -21,8 +21,7 @@ use std::collections::HashMap;
 use handlebars::Handlebars;
 use serde::Deserialize;
 
-use crate::config::config_file::LoadOrInitFile;
-use crate::prelude::*;
+use crate::{config::config_file::LoadOrInitFile, prelude::*};
 
 /// Embedded default-secrets text, dropped onto disk byte-for-byte the
 /// first time the secrets file is absent. `include_str!` pulls the
