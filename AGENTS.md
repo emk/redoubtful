@@ -14,7 +14,11 @@
     - `prelude.rs`: Key imports used everywhere.
     - `sandbox/`: Actual sandbox implementation.
 - `tests/`: Integration tests for the CLI interface.
-    - `cli.rs`: Main integration test binary.
+    - `cli/`: Main integration test binary.
+        - `utils/`: Support code for tests.
+        - `cmd/`: Tests for CLI entry points, excluding deeper sandbox behavior.
+        - `config.rs`: Tests for configuration and profiles.
+        - `sandbox/`: Tests for deeper sandbox behavior.
     - `fixtures/`: Files and directories needed to test.
 
 ## Useful commands
