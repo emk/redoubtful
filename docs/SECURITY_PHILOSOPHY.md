@@ -59,6 +59,16 @@ The proxy runs in-process on the host, never inside the sandbox. It serves two p
 - **MITM mode** — Proxy intercepts TLS, decrypts HTTP, injects/swap credentials, re-encrypts to real destination. Used for sites that need credential injection.
 - **Tunnel mode** — Proxy just pipes bytes bidirectionally. Client does real TLS to real destination. Used for allowlisted hosts that don't need credential injection.
 
+### Credentials at Rest
+
+Real secrets live in `~/.config/redoubtful/secrets.toml` (never in
+`config.toml`, which holds only templates). We do **not** yet enforce the
+file's mode — planned hardening is `0600` on create and a refuse-or-warn on
+group/world-readable files, landing with Stage 4 (credential
+injection/proxy consumption). Deliberately no keyring/password-manager
+integration: our primary use case is SSH into headless Linux, where
+keychains are limited. Revisit in a future iteration.
+
 ### Certificate Authority
 
 - Fresh CA keypair per sandbox session via `rcgen`

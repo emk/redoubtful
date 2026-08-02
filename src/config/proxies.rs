@@ -202,17 +202,20 @@ impl Proxies {
 }
 
 impl Finalize for Proxies {
-    /// Merge two proxy inventories: `public_web` is direct
-    /// replacement (right wins), `proxies` `BTreeMap` upserts
-    /// by hostname (right wins on collision, different hosts
-    /// concatenate).
+    /// Merge two proxy inventories: `public_web` is right-biased
+    /// `Option::or` (a right-side `None` falls through to the left's
+    /// value; a right-side `Some` wins), and `proxies` `BTreeMap`
+    /// upserts by hostname (right wins on collision, different hosts
+    /// concatenate). `public_web` follows the same scalar-extra
+    /// convention as `Mounts::readonly` and `EnvVars::path` — an
+    /// unspecified (`None`) layer must not wipe a specified value.
     fn merge_right_biased(&self, other: &Self) -> Self {
         let mut proxies = self.proxies.clone();
         for (host, proxy) in &other.proxies {
             proxies.insert(host.clone(), proxy.clone());
         }
         Self {
-            public_web: other.public_web,
+            public_web: other.public_web.or(self.public_web),
             proxies,
         }
     }
@@ -272,6 +275,42 @@ mod tests {
         let base = proxies.base_config();
         assert_eq!(base.public_web().unwrap(), ProxyAction::Allow);
         assert!(base.is_empty());
+    }
+
+    #[test]
+    fn proxies_merge_right_biased_none_does_not_clobber_left_some() {
+        // Right-biased `Option::or` convention (matches `Mounts::readonly`,
+        // `EnvVars::path`): a right-side `None` means "not specified" and
+        // falls through to the left's specified value, rather than wiping it.
+        let left = Proxies::with_entries(Some(ProxyAction::Deny), []);
+        let right = Proxies::default(); // public_web = None
+        let merged = left.merge_right_biased(&right);
+        assert_eq!(
+            merged.public_web().unwrap(),
+            ProxyAction::Deny,
+            "right `None` must not defeat left `Some(Deny)`",
+        );
+    }
+
+    #[test]
+    fn proxies_right_some_overrides_left_some() {
+        let left = Proxies::with_entries(Some(ProxyAction::Allow), []);
+        let right = Proxies::with_entries(Some(ProxyAction::Deny), []);
+        let merged = left.merge_right_biased(&right);
+        assert_eq!(merged.public_web().unwrap(), ProxyAction::Deny);
+    }
+
+    #[test]
+    fn proxies_finalize_default_preserves_public_web_allow() {
+        // Reproduces the pipeline in `Profile::finalize`: base (Some Allow)
+        // merged right-biased over a default/unspecified user layer (None).
+        let user_layer = Proxies::default(); // no `--public-web` given
+        let finalized = user_layer.finalize();
+        assert_eq!(
+            finalized.public_web().unwrap(),
+            ProxyAction::Allow,
+            "default public-web without a flag should be Allow, not None/deny",
+        );
     }
 
     #[test]

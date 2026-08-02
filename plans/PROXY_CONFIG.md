@@ -1,6 +1,6 @@
 # Proxy Configuration Sketch
 
-> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete.
+> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete. Stage 4 (credential injection) planned, not yet implemented. Stage 5 (E2E testing) intentionally left as a testing placeholder — human-led design.
 
 ## CLI Configuration
 
@@ -174,6 +174,25 @@ impl ResolveContext {
     }
 }
 ```
+
+### Credential file permissions (deferred hardening)
+
+**Remembered:** `secrets.toml` holds real credentials at rest on the host,
+but we currently do no enforcement of its file mode. Cheap, valuable
+hardening — planned to land alongside Stage 4, since that is the first
+stage that actually consumes secrets server-side:
+
+- On `SecretsFile::load_or_init` (or a validate pass), check the file mode
+  and refuse (or warn) if the file is group/world-readable (anything other
+  than `0600`).
+- chmod `0600` the file when we create it; warn when an existing file is
+  too permissive.
+- `config.toml` holds only templates, never plaintext secrets, so it does
+  not need the same treatment.
+
+This is deliberately *not* a password-manager/keyring story — our primary
+use case is SSH into headless Linux, where keychains are limited. Revisit
+in a future iteration if more than plaintext-on-disk is warranted.
 
 ## Plans for implementation stages
 
@@ -1243,4 +1262,331 @@ hosts from both CONNECT and intercepted HTTP requests.
 
 ### Stage 4: Modify proxy server to support credential injection
 
-TODO: Plan.
+**Scope:** Inject `headers`, `params`, and `auth` (Basic/Bearer) that were
+resolved into each [`Proxy`] during Stage 2. Split into two phases:
+
+- **Phase 4.1 — HTTP-forward injection** (no MITM): plain HTTP proxied via
+  `HTTP_PROXY` arrives at `handle_request` as an absolute-form URI; we
+  rewrite headers/params/auth and forward. Works today, independent of TLS.
+- **Phase 4.2 — HTTPS MITM + CA trust**: flip `should_intercept` per-host to
+  MITM, inject on the decrypted inner request, and wire the per-session CA
+  into the sandbox so clients trust the proxy's leaf certs.
+
+The config side (resolved `Proxy.headers/params/auth` as redacted `Secret`)
+is already done in Stage 2. This stage is entirely server-side
+(`src/sandbox/proxy.rs`) plus launcher wiring (`src/cmd/run.rs`,
+`src/sandbox/bwrap.rs`) for the CA.
+
+#### Key design decisions
+
+1. **Injection fundamentally needs MITM for HTTPS — but not for HTTP.**
+   Verified against hudsucker 0.24.0 (`src/proxy/internal.rs`):
+   - `proxy()` calls `handle_request` as the first hook for **every** request
+     (HTTP and CONNECT). For plain HTTP the request is already decrypted, so
+     we inject and return `Request`.
+   - For a CONNECT `handle_request` passes it through; `process_connect` then
+     calls `should_intercept`. `false` → raw byte tunnel (client's own TLS, no
+     injection possible). `true` → MITM: hudsucker terminates TLS with a leaf
+     cert signed by our per-session CA, then feeds the **decrypted** inner
+     request back through `proxy()` → `handle_request` again (absolute-form
+     URI — `serve_stream` rebuilds it with `scheme=https` + CONNECT authority;
+     normal method). We inject there and forward.
+   - So: HTTP injection never needs `should_intercept`; HTTPS injection is
+     impossible without it. Phase 4.1 keeps `should_intercept = false`.
+
+2. **`should_intercept` = MITM gate, purely for allowed hosts that need
+   injection.** Denied hosts keep short-circuiting in `handle_request` (the
+   403 path, unchanged from Stage 3) before `should_intercept` is ever
+   consulted, so `should_intercept` only needs to answer "do we MITM this
+   CONNECT?" = `allowed && has_injection_config`.
+
+3. **`handle_request` must distinguish CONNECT from a real request.**
+   `req.method() == Method::CONNECT` (authority-only URI) → return untouched
+   so `process_connect` / `should_intercept` take over. Any other method
+   (GET/POST/PUT... from HTTP-forward or MITM'd HTTPS) → inject, then return
+   `Request`. This is the "HTTP vs HTTPS — TBD" from Stage 3, now resolved:
+   the distinction is method, not scheme.
+
+4. **Injection is idempotent-friendly.** Headers overwrite (set beats
+   existing); query params merge and let the injected value win per key;
+   auth sets a single `Authorization` header. A host is never rewritten
+   twice in one pass.
+
+5. **CA trust wiring is the hard, risk-prone half.** The proxy already
+   persists the per-session CA cert to a temp file exposed via
+   `ProxyHandle::ca_cert_path()` (currently `#[expect(dead_code)]`). Phase 4.2
+   must make sandboxed clients trust it, without touching the host trust
+   store. The plan uses a **merged bundle** (host system bundle — found via
+   `openssl-probe::probe()` + our CA) bind-mounted read-only into the sandbox,
+   with every common CA env var pointing at it.
+
+#### Tricky issues identified
+
+- **URI form is narrower than feared — verified in hudsucker 0.24.0.**
+  `serve_stream` (`src/proxy/internal.rs:337`) *rebuilds* every HTTP/1.x
+  request URI to **absolute-form** (`scheme` + `authority` + path) before
+  calling `proxy()` → `handle_request`. So both of our injection paths arrive
+  absolute-form:
+  - HTTP-forward: client sends `GET http://host/path?q` (already absolute).
+  - MITM'd HTTPS: `serve_stream` adds `scheme=https` + CONNECT `authority`.
+  Origin-form (`/path`) is only a rare edge (a few HTTP clients send it
+  straight to an HTTP proxy). So the messy part collapses to "normalize any
+  URI form to a parseable `url::Url`, merge params, write back" — and can be
+  packaged as **one private function** in a dedicated rewrite module (see
+  Step 2).
+- **Credential-merge ordering confirmed (and a real `public_web` bug found
+  and fixed).** In `cmd_run`, `finalize_config_with_cli` (line 99) runs the
+  full load → fold-merge → finalize pass, which is where the user's
+  `Proxies` (with rendered `Secret` credentials) is finalized.
+  `start_proxy(&user_profile.proxies)` (line 118) hands that to the handler
+  **before** `proxy_profile(port)` merges in (line 121). So credentials are
+  resolved and captured correctly. **Bug found on review:**
+  `Proxies::merge_right_biased` used `public_web: other.public_web` (plain
+  replacement), which is inconsistent with the codebase's scalar-extra
+  convention (`Mounts::readonly`, `EnvVars::path` use right-biased
+  `Option::or`). That let a right-side `None` wipe a specified `Some` — so
+  the default `public_web = Allow` from `base_config` was clobbered to `None`
+  during `finalize`, meaning public web was **denied by default** (and the
+  `public_web()` accessor's `todo!("should be set by base_config")` could
+  fire). **Fixed:** `public_web: other.public_web.or(self.public_web)`, with
+  regression tests. This also resolves the proxy-profile clobber concern as a
+  side effect: `proxy_profile`'s default `None` no longer wipes the user's
+  finalized value.
+- **`Mounts::mount` is private.** `proxy_profile` needs to add the CA mount
+  in Phase 4.2, but `Mounts::mount` is `fn mount` (module-private; only
+  `Forwards::forward` is `pub` today). Make it `pub(crate)`.
+- **Trust-store detection: use `openssl-probe` (no hand-rolled distro list).**
+  The crate is *normally* used to configure an app's own SSL when linked
+  against musl / bundled OpenSSL — but it exposes exactly what we want
+  without touching our process env:
+  - `openssl_probe::probe() -> ProbeResult` returns `cert_file: Option<PathBuf>`
+    and `cert_dir: Vec<PathBuf>`. It honors an existing `SSL_CERT_FILE`/`SSL_CERT_DIR`
+    (if they point at existing files) first, then falls back to known paths.
+  - Linux `cert_file` candidates cover Debian/Ubuntu (`/etc/ssl/certs/ca-certificates.crt`),
+    CentOS/RHEL/Fedora (`/etc/pki/...`), Alpine (`/etc/ssl/cert.pem`), OpenSUSE, etc.
+  - We call `probe()` directly for the result; we deliberately **do not** call
+    `try_init_openssl_env_vars()` (that mutates our process env). `probe()` is
+    the clean "just give me the answer" path the user hoped existed.
+  - Use `probe().cert_file` as the system bundle to concatenate with our CA. If
+    only `cert_dir` is present (no single file), fall back to concatenating the
+    hashed certs in that dir (rare; note as an edge). Honoring a custom
+    `SSL_CERT_FILE` is a bonus — it respects users with non-default trust stores.
+- **Tool env-var matrix.** Different tools honor different vars, with two
+  semantics: *replace* (`SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`,
+  `GIT_SSL_CAINFO`) and *append* (`NODE_EXTRA_CA_CERTS`). Set the replace-typed
+  vars to the **merged** bundle (system + our CA, so public HTTPS still
+  verifies); `NODE_EXTRA_CA_CERTS` can point at the same merged bundle (Node
+  treats it as additional — harmless). See Step 5.
+- **No DNS in the sandbox.** The proxy resolves upstream host-side; a model
+  host like `prometheus.lan` must resolve on the *host*, not the sandbox. Not
+  new, but it constrains any E2E test (see Stage 5 placeholder).
+
+#### Step 1 (4.1): Add `Proxy::has_injection` flag
+
+**File:** `src/config/proxy.rs`
+
+```rust
+impl Proxy {
+    /// Whether this destination carries any credential-injection config.
+    pub fn has_injection(&self) -> bool {
+        !self.headers.is_empty() || !self.params.is_empty() || self.auth.is_some()
+    }
+}
+```
+
+**Tests** in `src/config/proxy.rs`: `has_injection_false_when_blank`,
+`has_injection_true_with_header`, `_with_param`, `_with_auth`.
+
+#### Step 2 (4.1): New `src/sandbox/rewrite.rs` module (package the messy URI work)
+
+**Files:** `src/sandbox/rewrite.rs` (new), `src/sandbox/mod.rs` (wire), `Cargo.toml`.
+
+Keep injection out of the handler so the URI normalization is **one
+self-contained, exhaustively-tested module** rather than inline handler
+scraps. A single entry point takes a `Proxy` config and mutates a request:
+
+```rust
+use hyper::{Body, Request};
+use crate::config::proxy::{Proxy, ProxyAuth};
+use crate::config::Secret;
+use std::collections::BTreeMap;
+
+/// A proxy's credential-injection config, ready to apply to a request.
+/// Built from a resolved [`Proxy`]; fields re-use the redacting `Secret`
+/// type so Debug/Display never leak values.
+#[derive(Debug, Clone)]
+pub struct Rewrite {
+    headers: BTreeMap<String, Secret>,
+    params: BTreeMap<String, Secret>,
+    auth: Option<ProxyAuth>,
+}
+
+impl Rewrite {
+    /// Build from a `Proxy` if it has anything to inject.
+    pub fn from_proxy(p: &Proxy) -> Option<Self> { ... }
+
+    /// Apply headers, query params, and auth to `req`.
+    pub fn apply(&self, req: &mut Request<Body>);
+}
+```
+
+- `apply` calls three private fns: `inject_headers`, `merge_query_params`,
+  `inject_auth`. Do **not** log injected values (secrets).
+- `merge_query_params` is the one messy function and the whole reason the
+  module exists. Contract: *given any absolute- or origin-form `hyper::Uri`,
+  append `params` to its query (idempotent per key: injected value wins) and
+  write back a valid `hyper::Uri` preserving the original form.* Internally:
+  - if the URI has scheme+authority → parse as-is with `url::Url`;
+  - else (rare origin-form) → parse `http://sandbox.invalid` + path/query and
+    write back only path+query;
+  - `query_pairs_mut().append_pair(k, v)` per param (auto-encodes);
+  - rebuild via `Uri::from_parts` from the original `uri.into_parts()`.
+- `inject_auth` — set a single `Authorization` header:
+  - `Basic { username, password }` → `Basic <b64(username:password)>`
+  - `Bearer { token }` → `Bearer <token>`
+
+**New dependencies** (`cargo add`): `url` (query merging), `base64` (Basic).
+
+**Tests** in `src/sandbox/rewrite.rs` (pure — build a `Request<Body>`, call
+`apply`, assert on the mutated request):
+
+| Test | Assert |
+|------|--------|
+| `inject_headers_sets_each_header` | headers present, old value overwritten |
+| `inject_params_merges_preserving_existing` | existing `?a=1` + `{b:2}` → `?a=1&b=2` |
+| `inject_params_encodes_special_chars` | value with space/`&`/`=` is percent-encoded |
+| `inject_params_origin_form` | origin-form `/path` gets query appended |
+| `inject_auth_basic` | `Authorization: Basic <b64(user:pass)>` |
+| `inject_auth_bearer` | `Authorization: Bearer <token>` |
+| `apply_injection_noop_with_blank_config` | request unchanged |
+| `injected_values_never_reach_debug_log` | no secret string in any tracing |
+
+#### Step 3 (4.1): Inject in `handle_request` allowed path
+
+**File:** `src/sandbox/proxy.rs`
+
+In the allowed branch of `handle_request`, before returning `Request`:
+
+```rust
+if req.method() == Method::CONNECT {
+    // HTTPS: pass through; MITM decision is should_intercept (Phase 4.2).
+    return hudsucker::RequestOrResponse::Request(req);
+}
+let mut req = req;
+if let Some(proxy) = self.proxies.get(&hostname) {
+    if proxy.has_injection() {
+        debug!(host = %host, "credential proxy: injecting into request");
+        apply_injection(&mut req, proxy);
+    }
+}
+hudsucker::RequestOrResponse::Request(req)
+```
+
+Denied path (403) is unchanged. Phase 4.1 `should_intercept` stays `false`.
+
+#### Step 4 (4.2): Flip `should_intercept` for MITM-needed hosts
+
+**File:** `src/sandbox/proxy.rs` and `src/config/proxies.rs`
+
+Add to `Proxies`:
+
+```rust
+/// Whether to MITM a CONNECT to `host`: allowed *and* needs injection.
+pub fn should_mitm(&self, host: &Hostname) -> bool {
+    matches!(self.get(host), Some(p) if p.action == ProxyAction::Allow && p.has_injection())
+}
+```
+
+`should_intercept` returns `self.proxies.should_mitm(&hostname)` (host
+normalized; `None` host → `false`, since there is nothing to inject).
+
+**Tests** in `src/config/proxies.rs`:
+
+| Test | Setup | Assert |
+|------|-------|--------|
+| `should_mitm_allowed_with_injection` | Allow + auth | `true` |
+| `should_mitm_allowed_no_injection` | Allow, blank | `false` (tunnel) |
+| `should_mitm_denied_with_injection` | Deny + auth | `false` (403 path) |
+| `should_mitm_unknown` | not in map | `false` |
+
+#### Step 5 (4.2): Build a merged CA bundle and wire trust (openssl-probe)
+
+**File:** `src/sandbox/ca_bundle.rs` (new, bundle build + `openssl-probe`),
+`src/config/mounts.rs` (`pub(crate)` mount), `src/sandbox/proxy.rs`
+`proxy_profile` (mount + env), `src/cmd/run.rs` (pass `ca_cert_path` in).
+
+1. `find_system_ca_bundle() -> Option<Vec<u8>>` — call `openssl_probe::probe()`
+   and read `cert_file`. Fall back to `cert_dir` (concatenate hashed certs;
+   rare) if no single file. Log `cert_file`/`cert_dir` at debug for
+   diagnosability. **Use `probe()`, never `try_init_openssl_env_vars()`** (it
+   would mutate our process env). Bonus: this honors a user's custom
+   `SSL_CERT_FILE`.
+2. `build_sandbox_ca_bundle(system: &[u8], our_ca: &[u8]) -> Vec<u8>` —
+   concatenate system bundle + our CA PEM into a fresh host-side
+   `NamedTempFile` (cleaned on teardown).
+3. Bind-mount the merged bundle ro into the sandbox at
+   `/etc/ssl/certs/ca-certificates.sandbox.crt` (make `Mounts::mount`
+   `pub(crate)` so `proxy_profile` can add it).
+4. `proxy_profile(port, ca_bundle_sandbox_path)` sets every common var to the
+   sandbox path:
+   - replace-semantics: `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`,
+     `GIT_SSL_CAINFO`
+   - append-semantics: `NODE_EXTRA_CA_CERTS` (same merged bundle — harmless)
+   Update `cmd_run` to pass `proxy_handle.ca_cert_path()` in.
+
+**No host-side trust-store mutation.** The CA never leaves the per-session
+`NamedTempFile` except into the sandbox bundle. If `probe()` finds no system
+bundle at all, fail loudly (a merged bundle would silently trust *only* our
+CA, breaking public HTTPS) rather than guess.
+
+#### Step 6 (4.2): Docs + dead-code cleanup
+
+- Update the `proxy.rs` module doc: remove "Credential injection deferred to
+  Stage 4" and describe both phases.
+- Remove `#[expect(dead_code)]` on `ProxyHandle::ca_cert_path` (now consumed),
+  `Proxies::get` is now used by `should_mitm`, and the `#[allow(dead_code)]`
+  on `Proxy`/`ProxyAuth` fields that feed injection.
+- Update `docs/SECURITY_PHILOSOPHY.md` and the header status line.
+
+#### Credential file permissions (companion hardening)
+
+Add to `SecretsFile::load_or_init` (and/or a validate pass in
+`resolve_context.rs`): enforce `0600` on the secrets file — refuse or warn if
+it is group/world-readable, chmod `0600` on create. See the
+"Credential file permissions" note above. This stage is the right moment:
+it is the first that reads secrets **into the running proxy**.
+
+#### Summary of files touched
+
+| File | Action |
+|------|--------|
+| `src/config/proxy.rs` | Add `Proxy::has_injection` (+ tests) |
+| `src/config/proxies.rs` | Add `Proxies::should_mitm` (+ tests) |
+| `src/sandbox/rewrite.rs` | **New** — `Rewrite` struct + URI/header/auth injection (+ tests) |
+| `src/sandbox/ca_bundle.rs` | **New** — `openssl-probe` discovery + merged-bundle build (+ tests) |
+| `src/config/mounts.rs` | Make `Mounts::mount` `pub(crate)` |
+| `src/sandbox/proxy.rs` | Handler routing, `should_intercept`, `proxy_profile` sig (mount + CA env) |
+| `src/cmd/run.rs` | Pass `ca_cert_path` into proxy profile |
+| `src/config/resolve_context.rs` | secrets file `0600` enforcement |
+| `Cargo.toml` | Add `url`, `base64`, `openssl-probe` |
+
+**Total:** ~8 files + 3 deps.
+
+**Expected risk level:** Moderate. Phase 4.1 (injection) is additive and
+unit-testable without TLS. Phase 4.2 (MITM + CA trust) is the riskiest: wrong
+`should_intercept` flips break real HTTPS, and a missing/failed system-bundle
+probe breaks public web. `ca_bundle.rs` and `rewrite.rs` isolate the
+hard-to-reason-about parts so the handler stays simple and the tricky logic
+is exhaustively unit-testable.
+
+**Integration with Stage 5 (testing):** Deferred by design — see the
+placeholder below. The E2E harness in `docs/proxy-testing-challenges.md` is
+the intended vehicle for validating both routing (Stage 3) and injection
+(Stage 4) end-to-end.
+
+### Stage 5: E2E testing (placeholder)
+
+**Status:** Not planned in detail. Human has ideas. Intent: drive a real
+request through the handler to a controllable hermetic upstream and assert
+routing + injection results (per `docs/proxy-testing-challenges.md`), closing
+the gap that let the Stage 3 routing bug through.
