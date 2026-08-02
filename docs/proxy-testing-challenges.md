@@ -2,7 +2,10 @@
 
 Notes on how to test the host-side proxy (allow/deny routing, and eventually
 credential injection) hermetically, and the networking model that makes it
-tricky.
+tricky. The overall TLS trust model for the proxy (and the reason HTTPS
+has extra machinery) lives in **`docs/SSL_DESIGN.md`**, which is
+canonical for that topic; this page focuses on the networking/driver
+harness and defers to it.
 
 > **Status:** Reference notes. Captures a bug we hit in Stage 3 and the
 > testing gap that let it through, plus the now-implemented harness for
@@ -148,9 +151,13 @@ credentials actually reached it:
 - inject a URL param → same
 - Basic/Bearer auth → same
 
-HTTPS tests will additionally require the CA trust wiring (bind-mount of the
-per-session CA + `SSL_CERT_FILE`/`GIT_SSL_CAINFO`), which isn't wired yet.
-HTTP is the fast path and covers the routing + injection logic without TLS.
+HTTPS routing tests (passthrough) are planned separately and need *no*
+CA trust wiring — see `docs/SSL_DESIGN.md` for the full TLS design and
+for why. HTTPS *injection* tests will additionally require the CA trust
+wiring (bind-mount of the per-session CA + `SSL_CERT_FILE`/`GIT_SSL_CAINFO`)
+and the upstream-client trust seam (`with_http_connector`), which aren't
+wired yet. HTTP is the fast path and covers the routing + injection logic
+without TLS.
 
 ## Open details for implementation
 

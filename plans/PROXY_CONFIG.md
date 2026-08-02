@@ -1262,6 +1262,16 @@ hosts from both CONNECT and intercepted HTTP requests.
 
 ### Stage 4: Modify proxy server to support credential injection
 
+> **TLS trust design → `docs/SSL_DESIGN.md` (canonical).** Stage 4 is the
+> first stage that lives on the HTTPS/MITM side, so read that doc before
+> this stage. It resolves the two critical HTTPS questions this stage
+> used to leave open: (a) how redoubtful's *upstream client* trusts the
+> real server (`with_http_connector` + an `openssl-probe`/`rustls-native-certs`
+> root store, a single source of SSL truth), which is the exact seam HTTPS
+> injection tests need; and (b) that WebSockets can be dropped or carried
+> on the same root store without breaking OpenAI-style LLM streaming or
+> MCP SSE.
+
 **Scope:** Inject `headers`, `params`, and `auth` (Basic/Bearer) that were
 resolved into each [`Proxy`] during Stage 2. Split into two phases:
 
@@ -1612,6 +1622,11 @@ routing bug through.
 
 **Still to plan (injection):** reuse the same harness with an upstream that
 **echoes what it received** (headers, query params, auth), so Stage 4 can
-assert injected credentials actually reached it. HTTPS tests additionally
-need the per-session CA trust wiring (`SSL_CERT_FILE`/`GIT_SSL_CAINFO`,
-bind-mounted merged bundle) that is planned in Stage 4 and not yet wired.
+assert injected credentials actually reached it. HTTPS *passthrough*
+routing tests are now planned too (a mirror of the HTTP pair, driving the
+CONNECT/raw-byte tunnel) and need **no** CA wiring; the full TLS design —
+including the upstream-client seam (`with_http_connector`) and the test
+HTTPS upstream (`tiny_http` + `ssl-rustls`, no OpenSSL) — is in
+**`docs/SSL_DESIGN.md` (canonical)**. HTTPS *injection* tests still need
+the per-session CA trust wiring (`SSL_CERT_FILE`/`GIT_SSL_CAINFO`,
+bind-mounted merged bundle), planned in Stage 4 and not yet wired.
