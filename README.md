@@ -86,3 +86,9 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 ```
 
 This disables Ubuntu's hardening, putting you back at the Linux defaults. But if you had done this in the past, you would have been exposed to a whole set of CVEs.
+
+## AI Policy
+
+This project is meant for sandboxing dodgy AI tools, including overenthusiatic local models that occasionally make mistakes. The code is almost entirely AI-written, under moderate to close human supervision, including human code review. Early work was done using Claude Opus 4.7, but as open models improved, the work is almost entirely done using models with MIT-licensed weights running under the [Pi](https://pi.dev/) coding harness _inside_ a `redoubtful` sandbox. There may be a few AI-written commits that aren't tagged as such, but most should have `Co-Authored-By` or `Assisted-by:` (preferred).
+
+However, this does not necessarily mean I'll read AI-written PRs, unless they're clear, short and do something important. If you want to propose something large or complicated, please file a human-written issue first! If large features are going to be implementing using AI, I would just as soon supervise that process.
