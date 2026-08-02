@@ -5,8 +5,10 @@ credential injection) hermetically, and the networking model that makes it
 tricky.
 
 > **Status:** Reference notes. Captures a bug we hit in Stage 3 and the
-> testing gap that let it through, plus a sketch of the harness we'll need
-> for Stage 4 (credential injection).
+> testing gap that let it through, plus the now-implemented harness for
+> Stage 5's HTTP routing E2E (`tests/cli.rs`). The same harness will be
+> extended (in the future / Stage 4) to validate credential injection with
+> a richer upstream that echoes what it received.
 
 ## The bug that motivated this
 
@@ -85,28 +87,56 @@ interface** and target that IP from inside the sandbox, e.g.
 - Proxy (host): connects to an address it literally owns. ✓
 - No name resolution anywhere.
 
+**Resolved target (as implemented): `127.0.1.1`.** Even better than a LAN
+IP — it is inside the `127.0.0.0/8` loopback block (so the host-side proxy
+can connect to it), but is **not** `127.0.0.1` and therefore falls outside
+the client's `NO_PROXY` (`localhost,127.0.0.1`), forcing the sandboxed
+client to route it through the proxy. No LAN IP, no DNS, no `/etc/hosts`
+entry, and no dependence on which physical interface the host happens to
+have — fully hermetic. Verified empirically: with `NO_PROXY =
+localhost,127.0.0.1`, `curl` to `http://127.0.1.1:<t>/` sends
+`GET http://127.0.1.1:<t>/ HTTP/1.1` (absolute-form) to the proxy, and the
+host-side proxy connects back to a listener bound on `127.0.1.1:<t>`.
+
 DNS only enters if we want real hostnames — then the name must resolve
 host-side to the listener (lean on `/etc/hosts` or a local DNS entry for
 hermeticity).
 
-## Harness sketch
+## Harness (as implemented)
+
+The sketch below is now real code in `tests/cli.rs` (`// ===== Proxy E2E:
+a real request through the handler =====`). The tiny HTTP upstream is
+`httptest` (`ServerBuilder::bind_addr(127.0.1.1:0)`), which removes the
+need to hand-roll HTTP parsing/response in the test; its `times(1..)`
+expectation keeps the drop-time assertion from flaking on the host-side
+control request. The `curl` client is the host's own (visible to the
+sandbox via bwrap's shared rootfs).
 
 ```
-spawn_upstream() → host IP + port
-    // tiny std::net HTTP server answering any GET with
+spawn_upstream() → (httptest::Server, target URL)
+    // httptest server bound to 127.0.1.1:0, answering any request with
     //   HTTP/1.1 200 OK
     //   <SENTINEL_BODY>
-    // bound to the host's routable IP (or 0.0.0.0)
+
+assert_upstream_reachable_on_host(&target)
+    // host curl --noproxy "*" to the target → positive control that
+    // the upstream is reachable (so a deny isn't misread as a dead
+    // listener).
 
 test: http_through_proxy_reaches_upstream_when_allowed
-    redoubtful run --public-web=allow sh -c 'curl -s http://IP:PORT/'
-    assert stdout contains SENTINEL_BODY
+    redoubtful run  curl -s <target>
+    assert sandbox stdout contains SENTINEL_BODY
     // old buggy code: got the 403 body → assertion fails ✓
 
 test: http_through_proxy_is_403_when_denied
-    redoubtful run --public-web=deny sh -c 'curl -s http://IP:PORT/'
-    assert stdout contains "denied by redoubtful proxy configuration"
+    redoubtful run --public-web=deny curl -s <target>
+    assert sandbox stdout contains "denied by redoubtful proxy configuration"
+    assert sandbox stdout does NOT contain SENTINEL_BODY
 ```
+
+Caveat: these are host-side integration tests (they spawn bwrap + pasta),
+so they do not run under `just check-sandbox` (which runs only unit tests
+— see the `justfile`); the full `just check` runs them on a real host.
 
 ## Future work (Stage 4 / credential injection)
 
@@ -122,8 +152,14 @@ HTTPS tests will additionally require the CA trust wiring (bind-mount of the
 per-session CA + `SSL_CERT_FILE`/`GIT_SSL_CAINFO`), which isn't wired yet.
 HTTP is the fast path and covers the routing + injection logic without TLS.
 
-## Open details for implementation (not resolved here)
+## Open details for implementation
 
-- Pinning the exact target IP/host so the client *must* route via the proxy
-  while the host-side proxy *can* reach the upstream (`NO_PROXY` boundary is
-  the constraint to get right).
+- **Pinning the exact target host — resolved for HTTP:** `127.0.1.1`
+  (`127.0.0.0/8` loopback, outside the client's `NO_PROXY`) satisfies both
+  constraints, as described in the shortcut section above. The routing E2E
+  tests in `tests/cli.rs` use it now.
+- **Still open for Stage 4 (injection):** the deny-side negative guard and
+  the assertion of *what was injected* will need an upstream that echoes its
+  received headers/params/auth (see "Future work" below), plus — for HTTPS
+  injection — the per-session CA trust wiring (`SSL_CERT_FILE` etc.), which
+  is not yet wired.

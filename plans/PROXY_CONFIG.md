@@ -1,6 +1,6 @@
 # Proxy Configuration Sketch
 
-> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete. Stage 4 (credential injection) planned, not yet implemented. Stage 5 (E2E testing) intentionally left as a testing placeholder — human-led design.
+> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete. Stage 4 (credential injection) planned, not yet implemented. Stage 5 (E2E testing): the HTTP routing harness is implemented (pulled ahead of Stage 4, per `docs/proxy-testing-challenges.md`); the injection E2E is still planned.
 
 ## CLI Configuration
 
@@ -1379,7 +1379,9 @@ is already done in Stage 2. This stage is entirely server-side
   treats it as additional — harmless). See Step 5.
 - **No DNS in the sandbox.** The proxy resolves upstream host-side; a model
   host like `prometheus.lan` must resolve on the *host*, not the sandbox. Not
-  new, but it constrains any E2E test (see Stage 5 placeholder).
+  new, but it constrains any E2E test. The Stage 5 routing harness dodges DNS
+  entirely by using the `127.0.1.1` IP literal (see `docs/
+  proxy-testing-challenges.md`).
 
 #### Step 1 (4.1): Add `Proxy::has_injection` flag
 
@@ -1579,14 +1581,37 @@ probe breaks public web. `ca_bundle.rs` and `rewrite.rs` isolate the
 hard-to-reason-about parts so the handler stays simple and the tricky logic
 is exhaustively unit-testable.
 
-**Integration with Stage 5 (testing):** Deferred by design — see the
-placeholder below. The E2E harness in `docs/proxy-testing-challenges.md` is
-the intended vehicle for validating both routing (Stage 3) and injection
-(Stage 4) end-to-end.
+**Integration with Stage 5 (testing):** The E2E harness in
+`docs/proxy-testing-challenges.md` is the vehicle for validating both
+routing (Stage 3) and injection (Stage 4) end-to-end. The routing half is
+now implemented (HTTP only) — see Stage 5 below. Injection E2E is still
+deferred: it will reuse the same harness with an echo upstream (plus CA
+trust wiring for HTTPS).
 
-### Stage 5: E2E testing (placeholder)
+### Stage 5: E2E testing (partial: HTTP routing done, injection pending)
 
-**Status:** Not planned in detail. Human has ideas. Intent: drive a real
-request through the handler to a controllable hermetic upstream and assert
-routing + injection results (per `docs/proxy-testing-challenges.md`), closing
-the gap that let the Stage 3 routing bug through.
+**Status:** The HTTP **routing** half of the E2E harness is implemented and
+validated (pulled ahead of Stage 4, ahead of the credential-injection work).
+It drives a real `curl` through `redoubtful run` → the hudsucker handler →
+a controllable hermetic upstream (via the `127.0.1.1` trick; see
+`docs/proxy-testing-challenges.md`), closing the gap that let the Stage 3
+routing bug through.
+
+**What's done:**
+
+- Two host-side integration tests in `tests/cli.rs`:
+  - `http_through_proxy_reaches_upstream_when_allowed` — default
+    `public_web = allow`, asserts the upstream sentinel reaches the sandbox.
+  - `http_through_proxy_is_403_when_denied` — `--public-web=deny`, asserts
+    the redoubtful 403 body and that the upstream sentinel did *not* arrive.
+- The hermetic target is `127.0.1.1` (loopback block, but *outside* the
+  client's `NO_PROXY`), with a `httptest` upstream and a host-side
+  reachability positive-control for each test.
+- Because these spawn bwrap + pasta they run under `just check` on a real
+  host (not `just check-sandbox`, which runs only unit tests).
+
+**Still to plan (injection):** reuse the same harness with an upstream that
+**echoes what it received** (headers, query params, auth), so Stage 4 can
+assert injected credentials actually reached it. HTTPS tests additionally
+need the per-session CA trust wiring (`SSL_CERT_FILE`/`GIT_SSL_CAINFO`,
+bind-mounted merged bundle) that is planned in Stage 4 and not yet wired.

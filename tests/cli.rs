@@ -20,7 +20,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{
+    collections::HashSet, net::SocketAddr, path::PathBuf, time::Duration,
+};
 
 use assert_cmd::Command;
 use predicates::{prelude::PredicateBooleanExt, str::contains};
@@ -1258,5 +1260,138 @@ fn proxy_flag_rejects_invalid_syntax() {
         stderr.contains("invalid")
             || stderr.contains("multiple `=` separators"),
         "stderr should mention the syntax error: {stderr}",
+    );
+}
+
+// ===== Proxy E2E: a real request through the handler =====
+//
+// These two tests close the gap that let the Stage 3 allow/deny routing
+// bug slip through. The `Proxies::should_allow` unit tests exercise the
+// *predicate* in isolation, but that bug was in the *wiring*: the routing
+// hook was wired into the wrong hudsucker callback, so every request —
+// including explicitly-allowed hosts — came back 403. Nothing drove a
+// real request through the handler to a controllable upstream, so the
+// predicate tests passed no matter how the handler was wired.
+//
+// Each test here does exactly that: `redoubtful run` a `curl` to an
+// HTTP target, which the sandboxed client sends to the proxy (because
+// `HTTPS_PROXY`/`HTTP_PROXY` are set). The host-side proxy decides
+// allow vs deny in `handle_request` and either forwards to the upstream
+// or short-circuits with a 403. We assert which happened.
+//
+// The upstream lives on `127.0.1.1`: inside the loopback block the
+// host-side proxy can reach, but NOT in the client's `NO_PROXY`
+// (`localhost,127.0.0.1`), so the sandboxed client is forced to send it
+// through the proxy rather than bypassing it. No DNS, no LAN IP, no
+// `/etc/hosts` — fully hermetic.
+
+/// Body the upstream echo serves for any request.
+const UPSTREAM_SENTINEL: &str = "redoubtful-proxy-e2e-sentinel-v1";
+
+/// Spawn an HTTP upstream on `127.0.1.1:0` that answers any request with
+/// [`UPSTREAM_SENTINEL`] and a `200 OK`.
+///
+/// Returns the server plus the target URL to hit it. The `Server` is
+/// kept alive for as long as the returned value is in scope; on drop it
+/// shuts down its background thread and asserts its expectations.
+fn spawn_upstream() -> (httptest::Server, String) {
+    let server = httptest::ServerBuilder::new()
+        .bind_addr(SocketAddr::from(([127u8, 0, 1, 1], 0)))
+        .run()
+        .expect("upstream binds on 127.0.1.1");
+    let target = server.url_str("/");
+    server.expect(
+        httptest::Expectation::matching(httptest::matchers::any())
+            // At-least-one hit: the host-side positive control already
+            // lands one request on the server in every test below, so an
+            // exact-count expectation (like the `times(1)` default) would
+            // be brittle.
+            .times(1..)
+            .respond_with(
+                httptest::responders::status_code(200).body(UPSTREAM_SENTINEL),
+            ),
+    );
+    (server, target)
+}
+
+/// Host-side positive control: fetch `target` directly (bypassing any
+/// host-level proxy) and assert the upstream sentinel arrives.
+///
+/// Guards the sandbox assertions below against a silently-broken upstream
+/// being misread as a routing pass or fail — the same two-stage pattern
+/// as the loopback-reachability tests.
+fn assert_upstream_reachable_on_host(target: &str) {
+    let out = std::process::Command::new("curl")
+        .args(["-s", "--max-time", "10", "--noproxy", "*", target])
+        .output()
+        .expect("host control curl failed to run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(UPSTREAM_SENTINEL),
+        "positive control failed: host curl to {target} did not return the \
+         upstream sentinel; got {stdout:?}\n\
+         stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Default `public_web` is `allow`, so an unknown host (`127.0.1.1`) is
+/// forwarded from the sandboxed client, through the proxy, to the
+/// upstream. This is the test that would have caught the Stage 3 bug
+/// (which 403'd every request regardless of allow/deny): under that bug,
+/// the sandboxed `curl` would print the 403 deny body instead of the
+/// sentinel, and this assertion would fail.
+#[test]
+fn http_through_proxy_reaches_upstream_when_allowed() {
+    let (_server, target) = spawn_upstream();
+    assert_upstream_reachable_on_host(&target);
+
+    let out = cmd()
+        .args(["run", "curl", "-s", "--max-time", "10", &target])
+        .output()
+        .expect("run curl through proxy");
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains(UPSTREAM_SENTINEL),
+        "sandboxed curl did not reach the upstream through the proxy; \
+         expected the upstream sentinel in stdout.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+/// `--public-web=deny` denies any host not explicitly allowed, so the
+/// unknown `127.0.1.1` request is short-circuited by the proxy's 403
+/// before it ever reaches the upstream. The host-side control proves the
+/// upstream *is* reachable, so the 403 is a routing decision, not a
+/// connection failure.
+#[test]
+fn http_through_proxy_is_403_when_denied() {
+    let (_server, target) = spawn_upstream();
+    assert_upstream_reachable_on_host(&target);
+
+    let out = cmd()
+        .args([
+            "run",
+            "--public-web=deny",
+            "curl",
+            "-s",
+            "--max-time",
+            "10",
+            &target,
+        ])
+        .output()
+        .expect("run curl with public-web denied");
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains(UPSTREAM_SENTINEL),
+        "denied request reached the upstream!\nstdout: {stdout}\nstderr: {stderr}",
+    );
+    assert!(
+        stdout.contains("denied by redoubtful proxy configuration"),
+        "expected redoubtful's 403 deny body in stdout.\n\
+         stdout: {stdout}\nstderr: {stderr}",
     );
 }
