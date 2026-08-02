@@ -52,8 +52,11 @@ xdg = "3.0.0"
 
 [dev-dependencies]
 assert_cmd = "2.2.1"
-httptest = "0.16.4"
+axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 predicates = "3.1.4"
+rcgen = "0.14.7"
+rustls = { version = "0.23", features = ["ring"] }
 # Cargo unifies tokio features with `[dependencies]`, so list only the
 # extras tests need on top of the runtime feature set.
 tokio = { version = "1.52.1", features = ["net", "io-util"] }

@@ -21,7 +21,7 @@
 
 - Standard `cargo` commands: `check`, `test`, etc. are available.
 - Use `cargo add` to add dependencies.
-- Run `just check` before **every commit!** Your code cannot be merged until this passes.
+- Run `just check-sandbox` before **every commit!** Your code cannot be merged until this passes. The user may run `just check` on your behalf, but that won't work for you if you're running inside the sandbox.
 
 ## Coding Philosophy
 

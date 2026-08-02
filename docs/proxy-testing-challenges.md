@@ -108,23 +108,24 @@ hermeticity).
 ## Harness (as implemented)
 
 The sketch below is now real code in `tests/cli.rs` (`// ===== Proxy E2E:
-a real request through the handler =====`). The tiny HTTP upstream is
-`httptest` (`ServerBuilder::bind_addr(127.0.1.1:0)`), which removes the
-need to hand-roll HTTP parsing/response in the test; its `times(1..)`
-expectation keeps the drop-time assertion from flaking on the host-side
-control request. The `curl` client is the host's own (visible to the
-sandbox via bwrap's shared rootfs).
+a real request through the handler =====`). Both upstreams — plain HTTP
+and TLS — are **axum + axum-server** servers (`spawn_axum_upstream(use_tls)`),
+each on its own background tokio runtime, bound to `127.0.1.1:0` and
+answered by a one-line axum handler. A rustls acceptor is the whole
+difference between HTTP and HTTPS (see `docs/SSL_DESIGN.md` for the TLS
+machinery). The `curl` client is the host's own (visible to the sandbox
+via bwrap's shared rootfs).
 
 ```
-spawn_upstream() → (httptest::Server, target URL)
-    // httptest server bound to 127.0.1.1:0, answering any request with
-    //   HTTP/1.1 200 OK
-    //   <SENTINEL_BODY>
+spawn_upstream() → (Upstream, target URL)      # plain HTTP
+spawn_https_upstream() → (Upstream, target URL) # TLS
+  // axum server bound to 127.0.1.1:0 (optional rustls), answering any
+  // request with 200 OK + <SENTINEL_BODY>
 
 assert_upstream_reachable_on_host(&target)
-    // host curl --noproxy "*" to the target → positive control that
-    // the upstream is reachable (so a deny isn't misread as a dead
-    // listener).
+  // host curl --noproxy "*" -k to the target → positive control that the
+  // upstream is reachable (so a deny isn't misread as a dead listener).
+  // -k is harmless for HTTP and needed for the self-signed TLS leaf.
 
 test: http_through_proxy_reaches_upstream_when_allowed
     redoubtful run  curl -s <target>
@@ -135,6 +136,22 @@ test: http_through_proxy_is_403_when_denied
     redoubtful run --public-web=deny curl -s <target>
     assert sandbox stdout contains "denied by redoubtful proxy configuration"
     assert sandbox stdout does NOT contain SENTINEL_BODY
+
+test: https_through_proxy_reaches_upstream_when_allowed
+    redoubtful run  curl -sk https://<target>   # CONNECT / raw-byte tunnel
+    assert sandbox stdout contains SENTINEL_BODY
+
+test: https_through_proxy_is_403_when_denied
+    redoubtful run --public-web=deny curl -skv https://<target>
+    assert the run FAILS  # a denied CONNECT is a curl tunnel error, not a
+                          # normal HTTP response -> no visible body
+    assert sandbox stdout does NOT contain SENTINEL_BODY
+    assert sandbox stderr contains "403"  # curl -v shows the proxy's CONNECT 403
+
+Note the HTTP/HTTPS asymmetry: a denied plain-HTTP `GET` is an ordinary
+403 response (curl prints the body, exits 0), but a denied **CONNECT** is
+a proxy tunnel error (curl prints no body, exits 56). The HTTPS-denied
+test asserts failure + 403-in-stderr instead of the deny body.
 ```
 
 Caveat: these are host-side integration tests (they spawn bwrap + pasta),
@@ -151,13 +168,13 @@ credentials actually reached it:
 - inject a URL param → same
 - Basic/Bearer auth → same
 
-HTTPS routing tests (passthrough) are planned separately and need *no*
-CA trust wiring — see `docs/SSL_DESIGN.md` for the full TLS design and
-for why. HTTPS *injection* tests will additionally require the CA trust
-wiring (bind-mount of the per-session CA + `SSL_CERT_FILE`/`GIT_SSL_CAINFO`)
-and the upstream-client trust seam (`with_http_connector`), which aren't
-wired yet. HTTP is the fast path and covers the routing + injection logic
-without TLS.
+The four HTTPS/HTTP routing tests above (passthrough) are implemented and
+need *no* CA trust wiring — see `docs/SSL_DESIGN.md` for the full TLS
+design and for why. HTTPS *injection* tests will additionally require the
+CA trust wiring (bind-mount of the per-session CA + `SSL_CERT_FILE`/
+`GIT_SSL_CAINFO`) and the upstream-client trust seam
+(`with_http_connector`), which aren't wired yet. HTTP is the fast path
+and covers the routing + injection logic without TLS.
 
 ## Open details for implementation
 

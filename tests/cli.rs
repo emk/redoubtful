@@ -1265,8 +1265,8 @@ fn proxy_flag_rejects_invalid_syntax() {
 
 // ===== Proxy E2E: a real request through the handler =====
 //
-// These two tests close the gap that let the Stage 3 allow/deny routing
-// bug slip through. The `Proxies::should_allow` unit tests exercise the
+// These tests close the gap that let the Stage 3 allow/deny routing bug
+// slip through. The `Proxies::should_allow` unit tests exercise the
 // *predicate* in isolation, but that bug was in the *wiring*: the routing
 // hook was wired into the wrong hudsucker callback, so every request —
 // including explicitly-allowed hosts — came back 403. Nothing drove a
@@ -1274,44 +1274,211 @@ fn proxy_flag_rejects_invalid_syntax() {
 // predicate tests passed no matter how the handler was wired.
 //
 // Each test here does exactly that: `redoubtful run` a `curl` to an
-// HTTP target, which the sandboxed client sends to the proxy (because
+// upstream, which the sandboxed client sends to the proxy (because
 // `HTTPS_PROXY`/`HTTP_PROXY` are set). The host-side proxy decides
 // allow vs deny in `handle_request` and either forwards to the upstream
 // or short-circuits with a 403. We assert which happened.
+//
+// There are four variants: plain HTTP (HTTP-forward) and HTTPS (CONNECT /
+// raw-byte tunnel), each with an allow and a deny case. HTTPS exercises
+// a path the HTTP-forward tests never touch — see
+// `docs/SSL_DESIGN.md`.
 //
 // The upstream lives on `127.0.1.1`: inside the loopback block the
 // host-side proxy can reach, but NOT in the client's `NO_PROXY`
 // (`localhost,127.0.0.1`), so the sandboxed client is forced to send it
 // through the proxy rather than bypassing it. No DNS, no LAN IP, no
 // `/etc/hosts` — fully hermetic.
+//
+// All upstreams are axum servers (with an optional rustls acceptor) on
+// their own background tokio runtime. Mocking HTTP and HTTPS with one
+// framework is deliberate: it gives us a single harness to grow into the
+// MITM credential-injection tests, which will need a richer upstream that
+// echoes what it received.
 
 /// Body the upstream echo serves for any request.
 const UPSTREAM_SENTINEL: &str = "redoubtful-proxy-e2e-sentinel-v1";
 
-/// Spawn an HTTP upstream on `127.0.1.1:0` that answers any request with
+/// Handle to a [`spawn_axum_upstream`] test upstream.
+///
+/// Owns the background thread (and its tokio runtime) running the axum
+/// server. Dropping it signals shutdown and joins the thread, aborting
+/// the server task and closing its listener — the usual "kept alive
+/// until the returned value is dropped" contract for a test upstream.
+struct Upstream {
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Upstream {
+    fn drop(&mut self) {
+        // Signal the background thread to stop; it finishes the select
+        // and drops its runtime (aborting the listener). Best-effort: if
+        // the thread already exited, the send is a no-op.
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Drive a server's `serve` future until `shutdown` fires, then return
+/// (letting the caller's runtime drop abort the listener).
+///
+/// Shared between the HTTP and TLS upstreams so their teardown stays
+/// identical.
+fn run_until_shutdown(
+    rt: &tokio::runtime::Runtime,
+    serve: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
+    rt.block_on(async {
+        tokio::select! {
+            r = serve => {
+                r.expect("test upstream serve failed");
+            }
+            _ = shutdown => {}
+        }
+    });
+}
+
+/// Spawn an axum test upstream on `127.0.1.1:0` that answers every
+/// request with [`UPSTREAM_SENTINEL`] and a `200 OK`, either plain HTTP
+/// (`use_tls = false`) or TLS (`use_tls = true`).
+///
+/// Returns the server handle plus the target URL. The handle is kept
+/// alive for as long as the returned value is in scope; on drop the
+/// background runtime shuts down and the listener closes.
+///
+/// We use axum-server as our "simple existing HTTPS server framework"
+/// (see `docs/SSL_DESIGN.md`) so HTTP and HTTPS mocking share one
+/// harness; the rustls acceptor is the whole difference.
+fn spawn_axum_upstream(use_tls: bool) -> (Upstream, String) {
+    use axum::{Router, routing::get};
+
+    // rustls can't auto-pick a crypto provider here: `aws-lc-rs` is
+    // enabled transitively (via hudsucker's hyper-rustls) alongside our
+    // pure-Rust `ring`, so the two feature flags are ambiguous. Pin the
+    // project's preferred pure-Rust `ring` backend explicitly; ignore the
+    // "already installed" error from a parallel test.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // TLS upstreams need a throwaway self-signed leaf. `curl -k` skips
+    // verification, so nothing has to trust it; the IP SAN keeps it
+    // semantically right for the 127.0.1.1 target.
+    let cert = if use_tls {
+        let c =
+            rcgen::generate_simple_self_signed(vec!["127.0.1.1".to_string()])
+                .expect("rcgen creates a self-signed test cert");
+        Some((
+            c.cert.pem().into_bytes(),
+            c.signing_key.serialize_pem().into_bytes(),
+        ))
+    } else {
+        None
+    };
+
+    // Bind inside the background runtime thread (NOT with a
+    // `std::net::TcpListener` handed across threads — tokio rejects
+    // registering a blocking socket cross-thread, issue #7172), and send
+    // the chosen ephemeral port back so we can build the target URL.
+    let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
+
+    // Answer every request with the sentinel body and a 200 OK.
+    let app = Router::new().route("/", get(|| async { UPSTREAM_SENTINEL }));
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let thread = std::thread::spawn(move || {
+        // Each test server runs on its own background tokio runtime.
+        let rt = tokio::runtime::Runtime::new()
+            .expect("tokio runtime for test upstream");
+
+        // Bind on the runtime so the socket is runtime-owned; report the
+        // port to the caller before serving.
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind(SocketAddr::from((
+                [127u8, 0, 1, 1],
+                0,
+            ))))
+            .expect("upstream binds on 127.0.1.1");
+        let _ = port_tx.send(
+            listener
+                .local_addr()
+                .expect("bound upstream has an address")
+                .port(),
+        );
+
+        match cert {
+            Some((cert_pem, key_pem)) => {
+                // `from_pem` is async (it parses the key/cert on the
+                // blocking pool), so build the rustls config inside the
+                // runtime.
+                let config = rt
+                    .block_on(axum_server::tls_rustls::RustlsConfig::from_pem(
+                        cert_pem, key_pem,
+                    ))
+                    .expect("rustls config from test cert");
+                let server =
+                    axum_server::Server::<std::net::SocketAddr>::from_listener(
+                        listener,
+                    )
+                    .acceptor(
+                        axum_server::tls_rustls::RustlsAcceptor::new(config),
+                    );
+                run_until_shutdown(
+                    &rt,
+                    server.serve(app.into_make_service()),
+                    shutdown_rx,
+                );
+            }
+            None => {
+                let server =
+                    axum_server::Server::<std::net::SocketAddr>::from_listener(
+                        listener,
+                    );
+                run_until_shutdown(
+                    &rt,
+                    server.serve(app.into_make_service()),
+                    shutdown_rx,
+                );
+            }
+        }
+    });
+
+    // Wait for the background thread to report its bound port.
+    let port = port_rx.recv().expect("upstream reported its port");
+    let scheme = if use_tls { "https" } else { "http" };
+    let target = format!("{scheme}://127.0.1.1:{port}/");
+
+    (
+        Upstream {
+            shutdown_tx: Some(shutdown_tx),
+            thread: Some(thread),
+        },
+        target,
+    )
+}
+
+/// Spawn a plain-HTTP upstream on `127.0.1.1:0` answering any request
+/// with [`UPSTREAM_SENTINEL`] and a `200 OK`.
+fn spawn_upstream() -> (Upstream, String) {
+    spawn_axum_upstream(false)
+}
+
+/// Spawn a TLS upstream on `127.0.1.1:0` answering any request with
 /// [`UPSTREAM_SENTINEL`] and a `200 OK`.
 ///
-/// Returns the server plus the target URL to hit it. The `Server` is
-/// kept alive for as long as the returned value is in scope; on drop it
-/// shuts down its background thread and asserts its expectations.
-fn spawn_upstream() -> (httptest::Server, String) {
-    let server = httptest::ServerBuilder::new()
-        .bind_addr(SocketAddr::from(([127u8, 0, 1, 1], 0)))
-        .run()
-        .expect("upstream binds on 127.0.1.1");
-    let target = server.url_str("/");
-    server.expect(
-        httptest::Expectation::matching(httptest::matchers::any())
-            // At-least-one hit: the host-side positive control already
-            // lands one request on the server in every test below, so an
-            // exact-count expectation (like the `times(1)` default) would
-            // be brittle.
-            .times(1..)
-            .respond_with(
-                httptest::responders::status_code(200).body(UPSTREAM_SENTINEL),
-            ),
-    );
-    (server, target)
+/// Unlike plain HTTP, an HTTPS request goes through the **CONNECT /
+/// raw-byte tunnel**: the sandboxed client sends the proxy a
+/// `CONNECT 127.0.1.1:<port>` and the proxy pipes raw bytes to this TLS
+/// server (no MITM, no CA wiring — see `docs/SSL_DESIGN.md`). The cert
+/// is a throwaway rcgen self-signed leaf, so both the sandboxed client
+/// and the host-side control use `curl -k`.
+fn spawn_https_upstream() -> (Upstream, String) {
+    spawn_axum_upstream(true)
 }
 
 /// Host-side positive control: fetch `target` directly (bypassing any
@@ -1320,9 +1487,14 @@ fn spawn_upstream() -> (httptest::Server, String) {
 /// Guards the sandbox assertions below against a silently-broken upstream
 /// being misread as a routing pass or fail — the same two-stage pattern
 /// as the loopback-reachability tests.
+///
+/// Uses `-k` so the same helper works for both the plain-HTTP upstream
+/// ([`spawn_upstream`], where it is a harmless no-op) and the TLS
+/// upstream ([`spawn_https_upstream`], whose throwaway self-signed
+/// cert must not be verified).
 fn assert_upstream_reachable_on_host(target: &str) {
     let out = std::process::Command::new("curl")
-        .args(["-s", "--max-time", "10", "--noproxy", "*", target])
+        .args(["-s", "-k", "--max-time", "10", "--noproxy", "*", target])
         .output()
         .expect("host control curl failed to run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1393,5 +1565,75 @@ fn http_through_proxy_is_403_when_denied() {
         stdout.contains("denied by redoubtful proxy configuration"),
         "expected redoubtful's 403 deny body in stdout.\n\
          stdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+/// HTTPS analog of
+/// [`http_through_proxy_reaches_upstream_when_allowed`]: default
+/// `public_web` is `allow`, so the unknown `127.0.1.1` request is tunneled
+/// from the sandboxed client, through the proxy's CONNECT / raw-byte path,
+/// to the TLS upstream. `-k` skips verifying the throwaway self-signed
+/// cert.
+#[test]
+fn https_through_proxy_reaches_upstream_when_allowed() {
+    let (_server, target) = spawn_https_upstream();
+    assert_upstream_reachable_on_host(&target);
+
+    let out = cmd()
+        .args(["run", "curl", "-sk", "--max-time", "10", &target])
+        .output()
+        .expect("run curl through proxy");
+    assert!(out.status.success(), "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains(UPSTREAM_SENTINEL),
+        "sandboxed curl did not reach the TLS upstream through the proxy; \
+         expected the upstream sentinel in stdout.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+/// HTTPS analog of [`http_through_proxy_is_403_when_denied`]:
+/// `--public-web=deny` denies any unknown host, so the `127.0.1.1`
+/// CONNECT is short-circuited by the proxy's 403 before it reaches the
+/// TLS upstream.
+///
+/// Unlike the plain-HTTP case (where the 403 is the response to the
+/// denied `GET`, so curl prints the body and exits 0), a denied
+/// **CONNECT** surfaces to curl as a proxy tunnel failure: it treats a
+/// non-2xx CONNECT as fatal, prints no body, and exits nonzero. So we
+/// assert the run *fails*, the upstream sentinel never arrives, and (via
+/// `curl -v`) stderr shows the proxy's 403 — proving it's our routing
+/// decision rather than a dead listener (which the host-side control
+/// already rules out).
+#[test]
+fn https_through_proxy_is_403_when_denied() {
+    let (_server, target) = spawn_https_upstream();
+    assert_upstream_reachable_on_host(&target);
+
+    let out = cmd()
+        .args([
+            "run",
+            "--public-web=deny",
+            "curl",
+            "-skv",
+            "--max-time",
+            "10",
+            &target,
+        ])
+        .output()
+        .expect("run curl with public-web denied");
+    assert!(!out.status.success(), "denied HTTPS should fail: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains(UPSTREAM_SENTINEL),
+        "denied request reached the TLS upstream!\n\
+         stdout: {stdout}\nstderr: {stderr}",
+    );
+    assert!(
+        stderr.contains("403"),
+        "expected the proxy's 403 on the denied CONNECT in stderr \
+         (curl -v); got:\nstderr: {stderr}",
     );
 }

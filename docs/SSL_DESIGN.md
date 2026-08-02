@@ -100,8 +100,8 @@ C library with a serious security-fix history, and it has caused minor
 API breakage over time. Any framework or dependency that would pull
 OpenSSL in (including its C bindings) is disqualified, and if a candidate
 offers an OpenSSL or rustls path we must take the rustls path. (This is
-why, below, the test server uses `tiny_http`'s `ssl-rustls` feature and
-rejects `ssl-openssl`.)
+why, below, the test server uses `axum-server`'s rustls path
+(`tls-rustls-no-provider`) and never an openssl one.)
 
 ### Streaming and WebSockets
 
@@ -152,13 +152,13 @@ a self-hosted sandbox endpoint speaks.
 
 ## Testing implications
 
-Two E2E HTTPS tests will mirror the existing HTTP routing pair
+Two E2E HTTPS tests mirror the existing HTTP routing pair
 (`http_through_proxy_*`) by exercising the **CONNECT / raw-byte tunnel**
 path — which the HTTP tests (HTTP-forward only) never touch, so they add
 real coverage.
 
-- `httptest` (current HTTP mock) has **no TLS support** (raw `TcpListener`
-  + hyper, no TLS feature).
+- `httptest` (our original HTTP mock) has **no TLS support** (raw
+  `TcpListener` + hyper, no TLS feature).
 - `wiremock`-rs also has **no TLS support** (the "Serving HTTPS" pages are
   the Java WireMock, easy to get fooled by).
 - `httpmock` supports HTTPS but couples it to bundled-reserved-hostname
@@ -171,31 +171,56 @@ HTTPS-capable server framework* with a one- or two-line handler: bind
 Both routing tests run on this host (bwrap + pasta + curl), like the HTTP
 pair.
 
-### The HTTPS test server
+### The test server: axum + axum-server (rustls)
 
-The leading candidate is **`tiny_http`** (synchronous, dead-simple):
+The chosen test server is **`axum-server` + `axum`** (the same
+framework we mock plain HTTP with, so HTTP and HTTPS share one harness):
 
 ```rust
-let server = tiny_http::Server::https(addr, SslConfig {
-    certificate: cert_pem,   // from rcgen
-    private_key: key_pem,    // from rcgen
-})?;
-for request in server.incoming_requests() {
-    request.respond(Response::from_string(HTTPS_SENTINEL))?;
-}
+let app = Router::new().route("/", get(|| async { HTTPS_SENTINEL }));
+let server =
+    axum_server::Server::<std::net::SocketAddr>::from_listener(listener)
+        .acceptor(axum_server::tls_rustls::RustlsAcceptor::new(config));
+server.serve(app.into_make_service())
 ```
 
-- `tiny_http` needs its **`ssl-rustls`** feature. `tiny_http` also offers
-  `ssl-openssl`, but OpenSSL is a hard no here (see Constraints above), so
-  we enable the rustls feature and never the openssl one.
-- `rcgen` (already a dependency for the proxy CA) generates the
-  throwaway self-signed cert/key for `SslConfig`.
-- Runs on a background thread, dropped at test teardown.
+Key decisions, all verified against the dependency sources:
 
-(If `tiny_http` proves unsuitable for any reason, the fallback is the
-same *simple existing handler framework* shape with a rustls-based server
-such as `axum-server`'s `bind_rustls` — the point is a simple existing
-framework, not a self-built HTTP stack.)
+- **Feature:** `axum-server`'s `tls-rustls-no-provider` feature (NOT
+  `tls-rustls`, which would additionally enable `rustls/aws-lc-rs`).
+  The rustls `tls_rustls` API is gated on `tls-rustls-no-provider`, so we
+  get `bind_rustls` / `RustlsConfig` / `RustlsAcceptor` without importing
+  the aws-lc C backend.
+- **Crypto provider:** `aws-lc-rs` is already enabled transitively by
+  hudsucker's `hyper-rustls` alongside our pure-Rust `ring`, so rustls
+  cannot auto-pick one. We call
+  `rustls::crypto::ring::default_provider().install_default()` once in the
+  test helper, honoring the project's pure-Rust preference. (`rustls` is
+  a dev-dep so the integration tests can reach it.)
+- **Port:** bound on a background tokio runtime via a
+  `tokio::net::TcpListener` (NOT a `std::net::TcpListener` handed across
+  threads — tokio rejects registering a blocking socket cross-thread,
+  issue #7172). The ephemeral port is reported back through a channel so
+  we can build the hermetic `127.0.1.1:<port>` target. `axum-server`'s
+  own `bind_rustls` can't hand back a `:0` bind's port (no public
+  `local_addr`), so we pre-bind a tokio listener and use
+  `Server::<SocketAddr>::from_listener(...)`.
+- **Teardown:** each upstream runs on its own background tokio `Runtime`
+  on a detached thread; the handle sends a oneshot shutdown and joins.
+  An `Upstream` (formerly `HttpsUpstream`) guard drops it at test end —
+  the `httptest::Server` "dropped at end of scope" contract.
+- `rcgen` (already a dependency for the proxy CA) generates the
+  throwaway self-signed leaf; the IP SAN keeps it semantically right for
+  the `127.0.1.1` target even though `curl -k` ignores it.
+- The upstream is async but the test driver is sync: we deliberately do
+  **not** convert the tests to async. The axum server lives on its own
+  background `Runtime`; the test (bwrap + pasta + curl) stays blocking.
+
+Rationale vs `tiny_http`: `tiny_http`'s `ssl-rustls` pulls in an
+**old rustls 0.20 + ring 0.16** (a second, older TLS implementation in
+ the tree). axum-server reuses the already-present rustls 0.23 / hyper /
+ tokio-rustls stack and moves in sync with it. The async-vs-sync hosting
+cost is absorbed by the shared background-`Runtime` upstream.
 
 **For clean MITM upgrade:** the test upstream should be CA-*issued* by a
 dedicated `rcgen` test CA (not a bare self-signed leaf), and the CA PEM
@@ -225,5 +250,7 @@ store) and the sandbox at it (via the existing sandbox-bundle machinery).
 - **New deps for the unify step:** `rustls-native-certs` (new, tiny) plus
   `hyper-rustls` and `hyper-util` (already transitively present; declare
   them directly to build the connector).
-- **Test-server deps:** `tiny_http` (dev-dep, feature `ssl-rustls`) plus
-  `rcgen` in dev-deps (already a main dep) for the throwaway cert/key.
+- **Test-server deps:** `axum` + `axum-server` (dev-deps, feature
+  `tls-rustls-no-provider`), `rustls` (dev-dep, to pin the `ring`
+  provider), plus `rcgen` in dev-deps (already a main dep) for the
+  throwaway cert/key.

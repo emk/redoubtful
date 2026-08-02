@@ -1615,18 +1615,22 @@ routing bug through.
   - `http_through_proxy_is_403_when_denied` — `--public-web=deny`, asserts
     the redoubtful 403 body and that the upstream sentinel did *not* arrive.
 - The hermetic target is `127.0.1.1` (loopback block, but *outside* the
-  client's `NO_PROXY`), with a `httptest` upstream and a host-side
+  client's `NO_PROXY`), with an axum-based upstream and a host-side
   reachability positive-control for each test.
 - Because these spawn bwrap + pasta they run under `just check` on a real
   host (not `just check-sandbox`, which runs only unit tests).
 
+**Also done (HTTPS routing):** the HTTPS passthrough pair (`https_*`), a
+mirror of the HTTP pair that drives the CONNECT/raw-byte tunnel instead of
+HTTP-forward, and needs **no** CA wiring. Both HTTP and HTTPS now mock
+with the same axum + axum-server upstream (an optional rustls acceptor is
+TLS); see `docs/SSL_DESIGN.md`.
+
 **Still to plan (injection):** reuse the same harness with an upstream that
 **echoes what it received** (headers, query params, auth), so Stage 4 can
-assert injected credentials actually reached it. HTTPS *passthrough*
-routing tests are now planned too (a mirror of the HTTP pair, driving the
-CONNECT/raw-byte tunnel) and need **no** CA wiring; the full TLS design —
+assert injected credentials actually reached it. The full TLS design —
 including the upstream-client seam (`with_http_connector`) and the test
-HTTPS upstream (`tiny_http` + `ssl-rustls`, no OpenSSL) — is in
+HTTPS upstream (axum-server, no OpenSSL) — is in
 **`docs/SSL_DESIGN.md` (canonical)**. HTTPS *injection* tests still need
 the per-session CA trust wiring (`SSL_CERT_FILE`/`GIT_SSL_CAINFO`,
 bind-mounted merged bundle), planned in Stage 4 and not yet wired.
