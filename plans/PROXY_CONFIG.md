@@ -1,6 +1,6 @@
 # Proxy Configuration Sketch
 
-> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete. Stage 4 (credential injection) **partially implemented** — Phase 4.1 (HTTP-forward injection, no MITM) is done and green; Phase 4.2 (HTTPS MITM + CA trust) is planned. Stage 5 (E2E testing): the HTTP routing harness is implemented (pulled ahead of Stage 4, per `docs/proxy-testing-challenges.md`); HTTP-forward injection E2E is green; HTTPS injection E2E is still planned.
+> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete. Stage 4 (credential injection) **partially implemented** — Phase 4.1 (HTTP-forward injection, no MITM) is done and green; Phase 4.2 (HTTPS MITM + CA trust) is planned. Stage 5 (E2E testing): the HTTP routing harness is implemented (pulled ahead of Stage 4, per `docs/proxy-testing-challenges.md`); HTTP-forward injection E2E is green; HTTPS injection E2E is still planned. SSL foundation: prerequisite 1 (single source of CA truth) is **done**; prerequisites 2 (CA1 test upstream) and 3 (drop `-k`) remain.
 >
 > **Revised phasing after review.** Work on the SSL/CA foundation *before* further HTTPS-side work. See "SSL foundation phasing" below for the updated order and the CA1+CA2 model.
 
@@ -272,7 +272,8 @@ This is the first prerequisite to build.
    trust the same roots the sandbox sees, via `with_http_connector`
    (for `docs/SSL_DESIGN.md` reasons) + `openssl-probe`/custom root store
    (not `.with_webpki_roots()`). This is the pre-existing "discovered
-   gap" the SSL design was written to close.
+   gap" the SSL design was written to close. **DONE** — the connector is
+   built in `src/sandbox/proxy.rs` (`build_upstream_connector`).
 2. **An actual CA1.** Convert the test upstream from a bare self-signed
    leaf to a CA-issued leaf (dedicated `rcgen` test CA, PEM kept as a
    test artifact), and point the test environment's `openssl-probe` /

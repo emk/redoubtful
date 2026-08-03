@@ -302,6 +302,16 @@ pub enum Error {
         reason: String,
     },
 
+    /// No system CA certificates were found for the proxy's upstream
+    /// TLS client. We fail loudly here rather than silently trusting
+    /// only our own CA — see `docs/SSL_DESIGN.md`, "single source of
+    /// SSL truth".
+    #[error(
+        "no CA certificates found on this system; set `SSL_CERT_FILE` or \
+         `SSL_CERT_DIR` so the proxy can verify HTTPS upstreams"
+    )]
+    NoRootCertificates,
+
     /// Another type of error.
     #[error("{message}")]
     Other {
@@ -528,6 +538,11 @@ impl Error {
     /// Create an [`Error::ProxyInvalidSyntax`].
     pub fn proxy_invalid_syntax(spec: String, reason: String) -> Self {
         Self::ProxyInvalidSyntax { spec, reason }
+    }
+
+    /// Create an [`Error::NoRootCertificates`].
+    pub fn no_root_certificates() -> Self {
+        Self::NoRootCertificates
     }
 
     /// Create an [`Error::Other`].

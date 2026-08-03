@@ -7,12 +7,15 @@
 > `docs/proxy-testing-challenges.md` — those refer here instead of
 > repeating the details.
 >
-> **IMPORTANT — not yet implemented.** The "single source of SSL truth"
-> goal below (upstream client off `with_webpki_roots()`, onto a shared
-> openssl-probe root store) is **still unimplemented**: `src/sandbox/proxy.rs`
-> still uses `.with_rustls_connector(...)` → `.with_webpki_roots()`.
+> **Status — prerequisite 1 (single source of CA truth) is IMPLEMENTED.**
+> `src/sandbox/proxy.rs` now builds the upstream-client connector with
+> `with_http_connector(...)` from a `rustls-native-certs` / `openssl-probe`
+> root store (off the compiled-in Mozilla roots); see
+> [`build_upstream_connector`](../src/sandbox/proxy.rs). Still *not*
+> implemented: the sandbox-leg CA bundle (CA2 appended to the merged
+> bundle), the CA1 test upstream, and dropping `-k` in passthrough tests.
 > Per the revised phasing in `plans/PROXY_CONFIG.md` ("SSL foundation
-> phasing"), this is the first prerequisite to build, before any HTTPS/MITM
+> phasing"), this was the first prerequisite to build, before any HTTPS/MITM
 > work or dropping `-k` in passthrough tests. This doc uses **CA1** (the
 > outside test/server CA) and **CA2** (redoubtful's internal MITM CA)
 > terminology — see the phasing doc for the who-verifies-which table.
@@ -153,7 +156,8 @@ a self-hosted sandbox endpoint speaks.
 2. **Unify hudsucker's upstream client on the system store** (choice 1
    above): swap `with_rustls_connector(provider)` for
    `with_http_connector(custom_https_connector)` built from a
-   `rustls-native-certs` root store.
+   `rustls-native-certs` root store. **DONE** — see
+   `build_upstream_connector` in `src/sandbox/proxy.rs`.
 3. **WebSockets — two acceptable options:**
    - *Carry them along on the same ClientConfig* via
      `with_websocket_connector(Connector::Rustls(Arc::new(client_config)))`,

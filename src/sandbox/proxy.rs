@@ -31,6 +31,13 @@
 //! path via [`ProxyHandle::ca_cert_path`] to bind-mount the cert into
 //! the sandbox, and sets CA-bundle env vars so sandboxed tools trust
 //! it.
+//!
+//! **Upstream TLS trust.** The proxy's outbound HTTPS connector — the
+//! one it will use when MITM-forwarding to a real upstream (Phase 4.2)
+//! — trusts the *system* CA bundle discovered by `openssl-probe`
+//! (honoring `SSL_CERT_FILE` / `SSL_CERT_DIR`), the same roots the
+//! sandbox sees, rather than hudsucker's compiled-in Mozilla roots.
+//! See [`build_upstream_connector`] and `docs/SSL_DESIGN.md`.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -43,7 +50,9 @@ use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper::{Method, Request, Response, StatusCode},
 };
+use hyper_util::client::legacy::connect::HttpConnector;
 use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
+use rustls::crypto::CryptoProvider;
 use tempfile::NamedTempFile;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
@@ -153,12 +162,17 @@ pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
     let provider = rustls::crypto::ring::default_provider();
     let ca = RcgenAuthority::new(issuer, 1024, provider.clone());
 
+    // Upstream-client trust: the same roots the sandbox sees (system
+    // bundle via openssl-probe), not hudsucker's compiled-in Mozilla
+    // roots. See `build_upstream_connector` and `docs/SSL_DESIGN.md`.
+    let upstream_connector = build_upstream_connector(&provider)?;
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let proxy = Proxy::builder()
         .with_listener(listener)
         .with_ca(ca)
-        .with_rustls_connector(provider)
+        .with_http_connector(upstream_connector)
         .with_http_handler(PassthroughHandler {
             proxies: proxies.clone(),
         })
@@ -239,6 +253,67 @@ fn build_throwaway_ca() -> Result<(Issuer<'static, KeyPair>, String)> {
     let issuer = Issuer::new(params, key_pair);
 
     Ok((issuer, ca_cert_pem))
+}
+
+/// Build the proxy's outbound HTTPS connector.
+///
+/// This is the *single source of CA truth* for the upstream-client leg
+/// (see `docs/SSL_DESIGN.md`). It trusts the system CA bundle discovered
+/// by `openssl-probe` via [`rustls_native_certs::load_native_certs`]
+/// (honoring the user's `SSL_CERT_FILE` / `SSL_CERT_DIR`), instead of
+/// hudsucker's default compiled-in Mozilla roots. If no bundle is found
+/// at all we fail loudly, rather than silently trusting only our own CA.
+///
+/// `https_or_http()` is required so plain-HTTP forwarding keeps working:
+/// hudsucker builds its single upstream `Client` from this connector,
+/// and HTTP-forward requests (the current Phase 4.1 path) use `http://`
+/// URIs through it — not just the future HTTPS MITM path.
+fn build_upstream_connector(
+    provider: &CryptoProvider,
+) -> Result<hyper_rustls::HttpsConnector<HttpConnector>> {
+    // Discover the system CA bundle. `rustls-native-certs` on Linux
+    // reads `openssl_probe::probe()`, which honors `SSL_CERT_FILE` /
+    // `SSL_CERT_DIR`.
+    let native = rustls_native_certs::load_native_certs();
+    for err in &native.errors {
+        warn!(error = %err, "skipping a malformed system CA certificate");
+    }
+    let roots = roots_from_certs(native.certs)?;
+
+    let client_config =
+        rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::other("could not configure proxy TLS", e))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+    Ok(hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(client_config)
+        .https_or_http()
+        .enable_http1()
+        .build())
+}
+
+/// Build a [`rustls::RootCertStore`] from a set of system CA
+/// certificates.
+///
+/// Fails loudly if there are none at all, rather than silently trusting
+/// only our own CA (see `docs/SSL_DESIGN.md`). Kept as a pure function
+/// so the empty-store guard is unit-testable without touching the real
+/// system store or `SSL_CERT_FILE`.
+fn roots_from_certs(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+) -> Result<rustls::RootCertStore> {
+    if certs.is_empty() {
+        return Err(Error::no_root_certificates());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).map_err(|e| {
+            Error::other("could not add a system CA certificate", e)
+        })?;
+    }
+    Ok(roots)
 }
 
 /// Proxy handler that enforces allow/deny rules and injects credentials
@@ -461,6 +536,31 @@ mod tests {
         let handle = start_proxy(&proxies).await.expect("proxy starts");
         assert!(handle.port > 0, "ephemeral port assigned");
         handle.shutdown().await;
+    }
+
+    // ===== upstream root store tests =====
+
+    #[test]
+    fn roots_from_certs_empty_fails_loudly() {
+        // The "single source of CA truth" guard: if the system store
+        // yields no certificates at all, we must fail rather than
+        // silently trust only our own CA.
+        let err = roots_from_certs(Vec::new()).expect_err("empty store errors");
+        assert!(matches!(err, Error::NoRootCertificates));
+    }
+
+    #[test]
+    fn roots_from_certs_loads_valid_certificates() {
+        use rcgen::{CertificateParams, KeyPair};
+
+        let key_pair = KeyPair::generate().expect("generates keypair");
+        let cert = CertificateParams::default()
+            .self_signed(&key_pair)
+            .expect("self-signs");
+
+        let roots = roots_from_certs(vec![cert.der().clone()])
+            .expect("one valid cert loads");
+        assert_eq!(roots.len(), 1, "one root in the store");
     }
 
     // ===== should_allow routing tests =====
