@@ -41,7 +41,7 @@ use std::{
 use hudsucker::{
     Body, HttpContext, HttpHandler, Proxy,
     certificate_authority::RcgenAuthority,
-    hyper::{Request, Response, StatusCode},
+    hyper::{Method, Request, Response, StatusCode},
 };
 use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
 use tempfile::NamedTempFile;
@@ -241,23 +241,22 @@ fn build_throwaway_ca() -> Result<(Issuer<'static, KeyPair>, String)> {
     Ok((issuer, ca_cert_pem))
 }
 
-/// Proxy handler that enforces allow/deny rules from the
-/// [`Proxies`] config.
+/// Proxy handler that enforces allow/deny rules and injects credentials
+/// from the [`Proxies`] config.
 ///
 /// hudsucker calls [`PassthroughHandler::handle_request`] as the
 /// gateway for every request (HTTP and CONNECT alike), so that's where
-/// allow/deny routing lives:
+/// routing and injection live:
 ///
-/// - Allowed hosts: the request is returned unchanged → plain HTTP is
-///   forwarded upstream, CONNECT streams are tunneled raw (no MITM).
+/// - Allowed HTTP requests: credentials (headers/params/auth) are
+///   injected for hosts that carry them, then the request is forwarded.
+/// - Allowed CONNECT: passed through untouched (MITM is a `should_intercept`
+///   decision, Phase 4.2).
 /// - Denied hosts: an HTTP 403 `Response` is returned, short-circuiting
 ///   the request before it reaches any upstream.
 ///
-/// Credential injection (headers, params, auth) is deferred to
-/// Stage 4 — allowed hosts always tunnel in this stage.
-///
 /// `should_intercept` is never consulted for routing — it only gates
-/// MITM on CONNECT, which Stage 3 does not do. `Clone` because
+/// MITM on CONNECT, which Phase 4.1 does not do. `Clone` because
 /// hudsucker clones the handler per connection; cloning `Arc` is cheap.
 #[derive(Clone)]
 struct PassthroughHandler {
@@ -289,7 +288,10 @@ impl HttpHandler for PassthroughHandler {
         _ctx: &HttpContext,
         req: Request<Body>,
     ) -> hudsucker::RequestOrResponse {
-        let host = req.uri().host().unwrap_or("unknown");
+        // Owned copy (not a borrow of `req`): we move `req` into the
+        // injection path below, so any `&str` derived from its URI would
+        // outlive the move.
+        let host = req.uri().host().unwrap_or("unknown").to_owned();
         let hostname =
             match req.uri().host().and_then(|h| h.parse::<Hostname>().ok()) {
                 Some(h) => h,
@@ -299,16 +301,37 @@ impl HttpHandler for PassthroughHandler {
                     // leaking into the hostname).
                     trace!(host, "unparseable host; denying");
                     return hudsucker::RequestOrResponse::Response(
-                        deny_response(host),
+                        deny_response(&host),
                     );
                 }
             };
-        if self.proxies.should_allow(&hostname) {
-            trace!(host = %host, "routing: forwarding/tunneling allowed host");
+        if !self.proxies.should_allow(&hostname) {
+            trace!(host, "denied request");
+            return hudsucker::RequestOrResponse::Response(deny_response(
+                &host,
+            ));
+        }
+        trace!(host = %host, "routing: forwarding allowed host");
+
+        if req.method() == Method::CONNECT {
+            // HTTPS CONNECT: pass through untouched. The MITM decision is
+            // `should_intercept` (Phase 4.2) — injection there happens on
+            // the decrypted inner request, not here.
             return hudsucker::RequestOrResponse::Request(req);
         }
-        trace!(host, "denied request");
-        hudsucker::RequestOrResponse::Response(deny_response(host))
+
+        // Plain HTTP (the HTTP-forward path): inject configured credential
+        // headers / query params / auth before forwarding.
+        let mut req = req;
+        if let Some(rewrite) = self
+            .proxies
+            .get(&hostname)
+            .and_then(crate::sandbox::rewrite::Rewrite::from_proxy)
+        {
+            debug!(host = %host, "injecting credentials into request");
+            rewrite.apply(&mut req);
+        }
+        hudsucker::RequestOrResponse::Request(req)
     }
 }
 

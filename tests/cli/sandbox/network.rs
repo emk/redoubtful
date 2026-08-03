@@ -3,7 +3,7 @@
 use predicates::str::contains;
 
 use crate::utils::{
-    cmd,
+    cmd, cmd_with_config,
     http::{
         UPSTREAM_SENTINEL, assert_upstream_reachable_on_host,
         spawn_https_upstream, spawn_upstream,
@@ -311,6 +311,108 @@ fn http_through_proxy_reaches_upstream_when_allowed() {
     );
 }
 
+// ===== Proxy E2E: credential injection (Stage 4) =====
+//
+// These tests verify that the proxy injects headers, query params, and
+// auth credentials into requests sent to configured hosts. HTTP-forward
+// injection (Phase 4.1) rewrites the request in `handle_request` before
+// it reaches the upstream — no MITM, no CA trust needed.
+//
+/// Set `headers`, `params`, and `auth` on a proxy entry, then assert
+/// the echo upstream reflects the injected values back.
+///
+/// This exercises the Phase 4.1 HTTP-forward injection path (no MITM,
+/// no CA trust wiring — just rewriting in `handle_request`).
+///
+/// **Currently red**: injection is not yet implemented, so the echoed
+/// response lacks the injected values and the assertions below fail.
+/// Once `handle_request` rewrites headers / params / auth before
+/// forwarding (Stage 4), the request reaches the upstream already
+/// injected and the assertions pass.
+#[test]
+fn credential_injection_injects_headers_params_and_auth() {
+    let (_server, target) = spawn_upstream();
+    assert_upstream_reachable_on_host(&target);
+
+    // Extract port from the target URL (http://127.0.1.1:PORT/).
+    let port: u16 = url::Url::parse(&target)
+        .expect("target is a URL")
+        .port()
+        .expect("target URL contains a port");
+
+    // `[[profile.inject-test.proxies]]` (not bare `[[proxies]]`): the
+    // proxy entries live *inside* the profile block, so the array-of
+    // -tables must use the full dotted path — a bare `[[proxies]]` would
+    // attach to the top level, which `ConfigFile` (profile-only) rejects.
+    let toml = format!(
+        r#"[profile.inject-test]
+[[profile.inject-test.proxies]]
+host = "127.0.1.1"
+port = {port}
+action = "allow"
+headers = {{ "X-Test-Token" = "test-token-value" }}
+params = {{ "api_key" = "injected-key" }}
+auth = {{ token = "injected-bearer-token" }}
+"#
+    );
+
+    let out = cmd_with_config(&toml)
+        .args([
+            "run",
+            "-u",
+            "inject-test",
+            "curl",
+            "-s",
+            "--max-time",
+            "10",
+            &target,
+        ])
+        .output()
+        .expect("run curl with injection config");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The request should reach the upstream (default allow), and the
+    // proxy should have injected the configured headers, params, and
+    // auth. The echo upstream reflects them back, so we assert they
+    // appear in the response.
+    //
+    // This is a red test until Stage 4 implements injection: with no
+    // injection the echoed response lacks these values, so the
+    // assertions below fail. Once `handle_request` rewrites headers /
+    // params / auth before forwarding, they pass.
+    assert!(
+        stdout.contains(UPSTREAM_SENTINEL),
+        "sandboxed curl did not reach the echo upstream; \
+         expected the upstream sentinel.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+
+    // URL query param injection.
+    assert!(
+        stdout.contains("QUERY: api_key=injected-key"),
+        "expected the injected query param reflected back by the echo \
+         upstream. This asserts that `params` injection is working.\n\
+         stdout: {stdout}\nstderr: {stderr}",
+    );
+
+    // Bearer auth injection -> `Authorization` header.
+    assert!(
+        stdout.contains("AUTHORIZATION: Bearer injected-bearer-token"),
+        "expected the injected bearer token reflected back by the echo \
+         upstream. This asserts that `auth` (Bearer) injection is \
+         working.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+
+    // Custom header injection.
+    assert!(
+        stdout.contains("X-TEST-TOKEN: test-token-value"),
+        "expected the injected custom header reflected back by the echo \
+         upstream. This asserts that `headers` injection is working.\n\
+         stdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
 /// `--public-web=deny` denies any host not explicitly allowed, so the
 /// unknown `127.0.1.1` request is short-circuited by the proxy's 403
 /// before it ever reaches the upstream. The host-side control proves the
@@ -358,6 +460,8 @@ fn https_through_proxy_reaches_upstream_when_allowed() {
     let (_server, target) = spawn_https_upstream();
     assert_upstream_reachable_on_host(&target);
 
+    // TODO: the `-k` goes away once the sandbox has proper certs (CA1 +
+    // CA2 bundle) so curl can verify against a real CA-issued upstream.
     let out = cmd()
         .args(["run", "curl", "-sk", "--max-time", "10", &target])
         .output()
@@ -385,6 +489,10 @@ fn https_through_proxy_reaches_upstream_when_allowed() {
 /// `curl -v`) stderr shows the proxy's 403 — proving it's our routing
 /// decision rather than a dead listener (which the host-side control
 /// already rules out).
+///
+/// TODO: the `-k` goes away once the sandbox has proper certs (CA1 +
+/// CA2 bundle), at which point this denies before any TLS handshake so
+/// it should still 403 regardless.
 #[test]
 fn https_through_proxy_is_403_when_denied() {
     let (_server, target) = spawn_https_upstream();

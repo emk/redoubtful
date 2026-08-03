@@ -6,6 +6,16 @@
 > related discussions in `plans/PROXY_CONFIG.md` and
 > `docs/proxy-testing-challenges.md` — those refer here instead of
 > repeating the details.
+>
+> **IMPORTANT — not yet implemented.** The "single source of SSL truth"
+> goal below (upstream client off `with_webpki_roots()`, onto a shared
+> openssl-probe root store) is **still unimplemented**: `src/sandbox/proxy.rs`
+> still uses `.with_rustls_connector(...)` → `.with_webpki_roots()`.
+> Per the revised phasing in `plans/PROXY_CONFIG.md` ("SSL foundation
+> phasing"), this is the first prerequisite to build, before any HTTPS/MITM
+> work or dropping `-k` in passthrough tests. This doc uses **CA1** (the
+> outside test/server CA) and **CA2** (redoubtful's internal MITM CA)
+> terminology — see the phasing doc for the who-verifies-which table.
 
 This document is about how different parts of redoubtful's stack decide
 which TLS certificates to trust, and why we want them to agree.
@@ -15,12 +25,18 @@ which TLS certificates to trust, and why we want them to agree.
 Trust lives in different places depending on who is doing the verifying.
 It helps to name all of them before reasoning about them:
 
+In CA1+CA2 terms (see `plans/PROXY_CONFIG.md`, "SSL foundation phasing"):
+**CA1** is the *outside* CA — in production, the public web of trust; in
+tests, our `rcgen` test CA that signs the test upstream's leaf. **CA2** is
+redoubtful's *inside* per-session MITM CA that signs the proxy's leaf
+certs.
+
 | Context | Who is verifying | What it trusts |
 |---|---|---|
-| **Real world ("outside")** | Public clients / servers | The public CA web of trust. We don't control this; it is the baseline everyone starts from. |
-| **Integration testing** | Our test tools | Hermetic throwaway CAs (e.g. an `rcgen` test CA that signs our test upstream's leaf cert). Fully ours to control. |
-| **hudsucker's upstream connections** | redoubtful's own TLS *client* | What the proxy trusts when it connects (MITM) to a real upstream server. |
-| **Code inside the sandbox** | sandboxed tools (`curl`, git, MCP clients, …) | What a sandboxed process trusts. This is what the plan's CA-bundle machinery targets. |
+| **Real world ("outside")** | Public clients / servers | **CA1** = the public CA web of trust. The baseline everyone starts from. |
+| **Integration testing** | Our test tools | **CA1** = a hermetic throwaway CA (`rcgen` test CA) that signs our test upstream's leaf cert. Fully ours to control. |
+| **hudsucker's upstream connections** | redoubtful's own TLS *client* | **CA1** (the upstream's CA) — what the proxy trusts when it MITM-connects to a real upstream. Does **not** need CA2. |
+| **Code inside the sandbox** | sandboxed tools (`curl`, git, MCP clients, …) | **CA1 + CA2** (the upstream's CA *and* redoubtful's MITM CA) — this is what the plan's CA-bundle machinery targets. |
 
 The two we care about most here are the last two. Everything below is
 about them.
@@ -55,11 +71,14 @@ loads it into a `rustls::RootCertStore`. Everything else derives from it:
   per-session MITM CA appended (so sandboxed tools trust redoubtful's
   leaf certs).
 
-So both legs share one base. Each leg adds only what it is for:
+So both legs share **CA1** as the base. Each leg adds only what it is for:
 
-- sandbox leg appends **redoubtful's internal MITM CA**;
-- (in tests) the upstream-client leg appends **the test CA** so redoubtful
-  can MITM-connect to our test HTTPS endpoint.
+- **sandbox leg** appends **CA2** (redoubtful's internal MITM CA) → trusts
+  **CA1 + CA2**, so sandboxed curl can verify the CA1-issued upstream in
+  passthrough AND the proxy's CA2 leaf in MITM;
+- **upstream-client leg** uses **CA1 only** (and, in tests, needs the test
+  CA to MITM-connect to our CA1-issued HTTPS endpoint) — it does **not**
+  need CA2, since the proxy never MITM-verifies its own leaf.
 
 ### How the upstream client gets the store
 
@@ -222,12 +241,22 @@ Rationale vs `tiny_http`: `tiny_http`'s `ssl-rustls` pulls in an
  tokio-rustls stack and moves in sync with it. The async-vs-sync hosting
 cost is absorbed by the shared background-`Runtime` upstream.
 
-**For clean MITM upgrade:** the test upstream should be CA-*issued* by a
-dedicated `rcgen` test CA (not a bare self-signed leaf), and the CA PEM
-kept as a test artifact. Passthrough tests can still use `curl -k`
-(no CA machinery needed now), but the CA is there for MITM: point
-redoubtful's upstream client at it (via `SSL_CERT_FILE` / the custom root
-store) and the sandbox at it (via the existing sandbox-bundle machinery).
+**For clean MITM upgrade (this is CA1):** the test upstream should be
+**CA1-issued** by a dedicated `rcgen` test CA (not a bare self-signed
+leaf; today `spawn_https_upstream` still uses
+`rcgen::generate_simple_self_signed`, so a CA1 does **not** exist yet),
+and the CA1 PEM kept as a test artifact. In test mode, point
+`SSL_CERT_FILE` / `openssl-probe` at CA1 so it masquerades as "the
+system store"; then:
+
+- **sandbox leg** trusts the merged **CA1 + CA2** bundle (CA2 = the
+  proxy's per-session MITM CA, appended on top), so curl can verify the
+  CA1-issued upstream in passthrough **and** the proxy's CA2 leaf in MITM;
+- **upstream-client leg** trusts **CA1** so redoubtful's own client can
+  MITM-connect to the test upstream (it does not need CA2).
+
+Passthrough tests can still use `curl -k` until the sandbox bundle
+(CA1 + CA2) is wired — the tunnel tests carry a `// TODO` waiting on it.
 
 ## Other details worth remembering
 

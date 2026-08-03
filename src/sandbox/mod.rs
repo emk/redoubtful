@@ -22,6 +22,7 @@ pub mod argv;
 pub mod bwrap;
 pub mod pasta;
 pub mod proxy;
+pub mod rewrite;
 
 pub use bwrap::bwrap_argv;
 pub use pasta::pasta_argv;

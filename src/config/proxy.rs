@@ -50,7 +50,7 @@ impl FromStr for ProxyAction {
 /// Stored in [`ProxyDecl`]. During [`Decl::resolve`], templates are
 /// rendered against secrets and converted to [`ProxyAuth`].
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, untagged)]
 pub enum ProxyAuthDecl {
     /// Basic authentication with username and password.
     Basic {
@@ -243,8 +243,8 @@ fn resolve_auth(
 /// `headers`, `params`, and `auth` carry [`Secret`] values that
 /// redact their contents in `Debug`, `Display`, and `Serialize`.
 ///
-/// Consumed by the proxy server at runtime (Stage 3) for
-/// destination routing and credential injection.
+/// Consumed by the proxy server at runtime for destination routing and
+/// credential injection.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Proxy {
@@ -378,6 +378,47 @@ mod tests {
         assert!(proxy.headers.is_empty());
         assert!(proxy.params.is_empty());
         assert!(proxy.auth.is_none());
+    }
+
+    // ===== Deserialize (TOML) =====
+
+    #[test]
+    fn proxy_auth_decl_deserializes_bearer_from_toml() {
+        // The `#[serde(untagged)]` on `ProxyAuthDecl` lets the TOML
+        // inline form `auth = { token = "..." }` infer the `Bearer`
+        // variant from the keys present, without an explicit tag.
+        let parsed: ProxyAuthDecl =
+            toml::from_str("token = \"injected-bearer-token\"")
+                .expect("Bearer auth parses from TOML");
+        match parsed {
+            ProxyAuthDecl::Bearer { token } => {
+                assert_eq!(token.0, "injected-bearer-token");
+            }
+            other => panic!("expected Bearer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proxy_auth_decl_deserializes_basic_from_toml() {
+        let parsed: ProxyAuthDecl =
+            toml::from_str("username = \"jdoe\"\npassword = \"password\"")
+                .expect("Basic auth parses from TOML");
+        match parsed {
+            ProxyAuthDecl::Basic { username, password } => {
+                assert_eq!(username.0, "jdoe");
+                assert_eq!(password.0, "password");
+            }
+            other => panic!("expected Basic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proxy_auth_decl_deserialize_rejects_unknown_key() {
+        let result = toml::from_str::<ProxyAuthDecl>("nope = \"x\"");
+        assert!(
+            result.is_err(),
+            "auth with an unknown key should be rejected"
+        );
     }
 
     #[test]

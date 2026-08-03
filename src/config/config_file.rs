@@ -328,6 +328,49 @@ mod tests {
     }
 
     #[test]
+    fn proxy_array_of_tables_nests_under_profile() {
+        // `[[proxies]]` alone wouldn't work: TOML attaches a bare
+        // array-of-tables to the *top* level, but `ConfigFile` only
+        // accepts `profile.*` keys, so it errors. The proxies must use
+        // the full dotted path `[[profile.NAME.proxies]]` to nest under
+        // the profile block. (The integration-test failure this guards
+        // against is the shape, not injection.)
+        let cfg = parse(
+            r#"[profile.inject-test]
+[[profile.inject-test.proxies]]
+host = "127.0.1.1"
+port = 12345
+action = "allow"
+headers = { "X-Test-Token" = "test-token-value" }
+params = { "api_key" = "injected-key" }
+auth = { token = "injected-bearer-token" }
+"#,
+        )
+        .expect("proxy profile parses");
+        let profile = cfg
+            .profile_decls
+            .get("inject-test")
+            .expect("inject-test profile present");
+        assert_eq!(
+            profile.proxy_decls.proxies.len(),
+            1,
+            "one proxy entry should nest under the profile",
+        );
+        let decl = &profile.proxy_decls.proxies[0];
+        assert_eq!(decl.host.as_ref(), "127.0.1.1");
+        assert_eq!(decl.port, 12345);
+        assert_eq!(decl.action, crate::config::proxy::ProxyAction::Allow);
+        assert_eq!(decl.headers["X-Test-Token"].0, "test-token-value");
+        assert_eq!(decl.params["api_key"].0, "injected-key");
+        match &decl.auth {
+            Some(crate::config::proxy::ProxyAuthDecl::Bearer { token }) => {
+                assert_eq!(token.0, "injected-bearer-token");
+            }
+            other => panic!("expected Bearer auth, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn uses_field_round_trips() {
         let cfg = parse("[profile.full]\nuses = [\"git-config\", \"rust\"]\n")
             .expect("parses");

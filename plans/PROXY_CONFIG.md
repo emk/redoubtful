@@ -1,6 +1,8 @@
 # Proxy Configuration Sketch
 
-> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete. Stage 4 (credential injection) planned, not yet implemented. Stage 5 (E2E testing): the HTTP routing harness is implemented (pulled ahead of Stage 4, per `docs/proxy-testing-challenges.md`); the injection E2E is still planned.
+> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete. Stage 4 (credential injection) **partially implemented** — Phase 4.1 (HTTP-forward injection, no MITM) is done and green; Phase 4.2 (HTTPS MITM + CA trust) is planned. Stage 5 (E2E testing): the HTTP routing harness is implemented (pulled ahead of Stage 4, per `docs/proxy-testing-challenges.md`); HTTP-forward injection E2E is green; HTTPS injection E2E is still planned.
+>
+> **Revised phasing after review.** Work on the SSL/CA foundation *before* further HTTPS-side work. See "SSL foundation phasing" below for the updated order and the CA1+CA2 model.
 
 ## CLI Configuration
 
@@ -193,6 +195,109 @@ stage that actually consumes secrets server-side:
 This is deliberately *not* a password-manager/keyring story — our primary
 use case is SSH into headless Linux, where keychains are limited. Revisit
 in a future iteration if more than plaintext-on-disk is warranted.
+
+## SSL foundation phasing (revised after review)
+
+We bit off too much when we aimed at full MITM credential injection in one
+pass: several prerequisites were missing, and the HTTPS side turns out to
+sit on an unimplemented SSL foundation. Do the foundation *first*, in a
+strict order, so each step is independently testable and lands green.
+
+The two-phase split already in Stage 4 (4.1 HTTP-forward injection vs 4.2
+HTTPS MITM) is right, but **4.1 is done** and 4.2 must wait on the SSL
+work below — the HTTPS injection tests cannot green until the CA plumbing
+exists.
+
+### The CA1 + CA2 model
+
+There are two independent certificate authorities in our world:
+
+- **CA1** — *outside*, the test upstream's CA. In tests this is a
+  dedicated `rcgen` test CA that signs the upstream's leaf, with the CA
+  PEM kept as a test artifact. (Today the test upstream is a bare
+  throwaway *self-signed* leaf with no CA; nothing can verify it except
+  `curl -k`.) In production there is no CA1 — the "outside" CA1 is the
+  real public web of trust.
+- **CA2** — *inside*, the proxy's per-session MITM CA. The proxy signs
+  leaf certs with CA2 for hosts it MITMs, and persists CA2's PEM to a
+  temp file exposed via `ProxyHandle::ca_cert_path()`.
+
+In test mode we set env vars (e.g. `SSL_CERT_FILE`) to point
+`openssl-probe::probe()` at **CA1**, making CA1 masquerade as "the system
+store" (it does not contain any real roots, which is fine and hermetic).
+The proxy then appends its own **CA2** to the sandbox bundle.
+
+### Which SSL context sees which roots
+
+There are **two** trust legs, each deciding independently what to
+verify against — keep them straight; they do not share one bundle:
+
+| Leg | Who verifies | Trusts |
+|-----|--------------|--------|
+| **Sandbox leg** (curl, git inside sandbox) | sandboxed tools | merged bundle = `CA1` (as "system") + `CA2` appended |
+| **Upstream-client leg** (proxy's own TLS client, used only when MITM-forwarding) | redoubtful itself | `CA1` (the upstream's CA) — does **not** need CA2 |
+
+Consequences for the three request paths:
+
+- **Passthrough / tunnel** (host without injection config, so
+  `should_intercept` is false): the proxy pipes raw bytes. The sandboxed
+  client does TLS *directly* with the upstream, and verifies the upstream's
+  **CA1-issued** leaf against CA1 in the sandbox bundle. The proxy CA2 is
+  never involved. (Today this is only why the tunnel tests use `curl -k`.)
+- **MITM** (host with injection config, so `should_intercept` is true):
+  the proxy terminates TLS and presents a **CA2**-signed leaf; the
+  sandboxed client verifies against CA2 in the bundle. The proxy then
+  reconnects to the upstream with its own client, which must verify the
+  upstream against **CA1** — this is the `with_http_connector` + custom
+  root-store work below.
+
+### The two current sources of "CA truth" (the problem)
+
+Today redoubtful has two *separate* trust stores that should be one:
+
+1. **Sandbox leg**: `src/config/mounts.rs` ro-binds the whole host `/etc`
+   into the sandbox, so sandboxed curl/git read the host's real
+   `/etc/ssl/certs` bundle.
+2. **Upstream-client leg**: `src/sandbox/proxy.rs` uses
+   `.with_rustls_connector(...)` → `.with_webpki_roots()` — baked-in
+   Mozilla roots, *not* the system store and *not* openssl-probe.
+
+`docs/SSL_DESIGN.md` describes unifying them under `openssl-probe`, but
+**that is unimplemented** (the doc's status is "Reference design notes").
+This is the first prerequisite to build.
+
+### Revised phasing order
+
+1. **Single source of CA truth.** Make the proxy's upstream-client leg
+   trust the same roots the sandbox sees, via `with_http_connector`
+   (for `docs/SSL_DESIGN.md` reasons) + `openssl-probe`/custom root store
+   (not `.with_webpki_roots()`). This is the pre-existing "discovered
+   gap" the SSL design was written to close.
+2. **An actual CA1.** Convert the test upstream from a bare self-signed
+   leaf to a CA-issued leaf (dedicated `rcgen` test CA, PEM kept as a
+   test artifact), and point the test environment's `openssl-probe` /
+   `SSL_CERT_FILE` at CA1.
+3. **Drop `-k` in the existing passthrough tests.** Only meaningful once
+   the sandbox has proper certs (the CA1+CA2 bundle), so curl can verify
+   against a real CA1-issued upstream. The tunnel tests carry a `// TODO`
+   currently waiting on this.
+4. **MITM** (`should_intercept` per-host: `allowed && has_injection_config`),+
+   inject on the decrypted inner request, wire the per-session CA2 into
+   the sandbox (bind-mount the merged CA1+CA2 bundle + set the CA env
+   vars). *Then* the HTTPS injection tests go green.
+
+### Known config bugs fixed while wiring the red test
+
+Two real bugs surfaced while getting the HTTP-forward injection test
+green — both worth remembering:
+
+- **`ProxyAuthDecl` needed `#[serde(untagged)]`** for the TOML
+  `auth = { token = "..." }` shape. It was in the plan but missing in
+  code. Fixed in `src/config/proxy.rs` with deserialization unit tests.
+- **TOML array-of-tables nesting:** `[[proxies]]` under `[profile.x]`
+  attaches to the *top* level (rejected by `ConfigFile`, profile-only).
+  Must use the full dotted path `[[profile.x.proxies]]`. Guarded with a
+  unit test in `src/config/config_file.rs`.
 
 ## Plans for implementation stages
 
@@ -1262,9 +1367,15 @@ hosts from both CONNECT and intercepted HTTP requests.
 
 ### Stage 4: Modify proxy server to support credential injection
 
-> **TLS trust design → `docs/SSL_DESIGN.md` (canonical).** Stage 4 is the
-> first stage that lives on the HTTPS/MITM side, so read that doc before
-> this stage. It resolves the two critical HTTPS questions this stage
+> **TLS trust design → `docs/SSL_DESIGN.md` (canonical) + the "SSL
+> foundation phasing" section above.** Stage 4's HTTPS/MITM side sits on
+> an **unimplemented SSL foundation** (the `with_http_connector` / custom
+> root-store work is a pre-existing gap, not yet landed). Per the revised
+> phasing, do the SSL foundation first, so Phase 4.2 is only possible
+> after CA1+CA2 exist. Phase 4.1 (HTTP-forward injection) is **done**
+> and independent of all of it.
+>
+> The doc above resolves the two critical HTTPS questions this stage
 > used to leave open: (a) how redoubtful's *upstream client* trusts the
 > real server (`with_http_connector` + an `openssl-probe`/`rustls-native-certs`
 > root store, a single source of SSL truth), which is the exact seam HTTPS
@@ -1277,10 +1388,16 @@ resolved into each [`Proxy`] during Stage 2. Split into two phases:
 
 - **Phase 4.1 — HTTP-forward injection** (no MITM): plain HTTP proxied via
   `HTTP_PROXY` arrives at `handle_request` as an absolute-form URI; we
-  rewrite headers/params/auth and forward. Works today, independent of TLS.
+  rewrite headers/params/auth and forward. **DONE and green.**
+  Implemented via a `src/sandbox/rewrite.rs` module
+  (`Rewrite::from_proxy` builds it when a host carries headers / params /
+  auth; headers / query-params / Basic+Bearer auth, URI normalization via
+  `url`), wired into `handle_request`'s allowed path. `should_intercept`
+  stays `false`. Independent of TLS.
 - **Phase 4.2 — HTTPS MITM + CA trust**: flip `should_intercept` per-host to
   MITM, inject on the decrypted inner request, and wire the per-session CA
-  into the sandbox so clients trust the proxy's leaf certs.
+  into the sandbox so clients trust the proxy's leaf certs. **Blocked on
+  the SSL foundation phasing above** (single CA truth, CA1, sandbox bundle).
 
 The config side (resolved `Proxy.headers/params/auth` as redacted `Secret`)
 is already done in Stage 2. This stage is entirely server-side
@@ -1598,14 +1715,22 @@ now implemented (HTTP only) — see Stage 5 below. Injection E2E is still
 deferred: it will reuse the same harness with an echo upstream (plus CA
 trust wiring for HTTPS).
 
-### Stage 5: E2E testing (partial: HTTP routing done, injection pending)
+### Stage 5: E2E testing (partial: routing + HTTP-forward injection done, HTTPS injection pending)
 
-**Status:** The HTTP **routing** half of the E2E harness is implemented and
-validated (pulled ahead of Stage 4, ahead of the credential-injection work).
-It drives a real `curl` through `redoubtful run` → the hudsucker handler →
-a controllable hermetic upstream (via the `127.0.1.1` trick; see
-`docs/proxy-testing-challenges.md`), closing the gap that let the Stage 3
-routing bug through.
+**Status:** The HTTP **routing** half and the **HTTP-forward injection**
+half of the E2E harness are implemented and validated. Routing was pulled
+abead of Stage 4, ahead of the credential-injection work. Injection came
+in with Phase 4.1. Both drive a real `curl` through `redoubtful run` →
+the hudsucker handler → a controllable hermetic upstream (via the
+`127.0.1.1` trick; see `docs/proxy-testing-challenges.md`), closing the
+gap that let the Stage 3 routing bug through.
+
+The upstream harness was unified into one echo-capable axum server
+(`tests/cli/utils/http.rs`): it returns the sentinel first, then reflects
+back the query string, `Authorization`, and `X-Test-Token` when present.
+This lets plain reachability, deny, and credential-injection assertions
+share one upstream (sentinel-only when nothing is injected). See
+`docs/SSL_DESIGN.md`.
 
 **What's done:**
 
@@ -1626,11 +1751,15 @@ HTTP-forward, and needs **no** CA wiring. Both HTTP and HTTPS now mock
 with the same axum + axum-server upstream (an optional rustls acceptor is
 TLS); see `docs/SSL_DESIGN.md`.
 
-**Still to plan (injection):** reuse the same harness with an upstream that
-**echoes what it received** (headers, query params, auth), so Stage 4 can
-assert injected credentials actually reached it. The full TLS design —
-including the upstream-client seam (`with_http_connector`) and the test
-HTTPS upstream (axum-server, no OpenSSL) — is in
-**`docs/SSL_DESIGN.md` (canonical)**. HTTPS *injection* tests still need
-the per-session CA trust wiring (`SSL_CERT_FILE`/`GIT_SSL_CAINFO`,
-bind-mounted merged bundle), planned in Stage 4 and not yet wired.
+**Done (HTTP-forward injection):** `credential_injection_injects_headers_params_and_auth`
+drives a real `curl` through `redoubtful run` → the handler's HTTP-forward
+grant with `headers`/`params`/`auth` configured, and asserts the echo
+upstream reflects the injected values back. Greens with Phase 4.1.
+
+**Still to plan (HTTPS injection):** the HTTPS *injection* tests need the
+full TLS/CA foundation first — the upstream-client seam
+(`with_http_connector`) and the test HTTPS upstream signed by **CA1**
+(see `docs/SSL_DESIGN.md`, canonical), then the per-session CA2 trust
+wiring (`SSL_CERT_FILE`/`GIT_SSL_CAINFO`, bind-mounted merged CA1+CA2
+bundle). Per the revised phasing, this is the LAST step, after single-source
+CA truth and an actual CA1.

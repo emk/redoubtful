@@ -125,11 +125,8 @@ impl Proxies {
     /// Look up the proxy entry for a (presumably already-normalized)
     /// hostname. Returns `None` if the host is not explicitly configured.
     ///
-    /// Used by the proxy server handler for host lookup, and by
-    /// Stage 4 for credential injection. Currently unused in
-    /// production code as `should_allow` covers Stage 3, but kept
-    /// for future use.
-    #[allow(dead_code)]
+    /// Used by the proxy server handler for host lookup and credential
+    /// injection.
     pub fn get(&self, host: &Hostname) -> Option<&Proxy> {
         self.proxies.get(host)
     }

@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 
 // All upstreams are axum servers (with an optional rustls acceptor) on
 // their own background tokio runtime. Mocking HTTP and HTTPS with one
-// framework is deliberate: it gives us a single harness to grow into the
-// MITM credential-injection tests, which will need a richer upstream that
-// echoes what it received.
+// framework is deliberate: the same [`echo_handler`] serves every
+// request, returning the sentinel followed by the reflected query /
+// `Authorization` / `X-Test-Token` when present — so plain reachability
+// tests and MITM credential-injection tests share one upstream.
 
 /// Body the upstream echo serves for any request.
 pub const UPSTREAM_SENTINEL: &str = "redoubtful-proxy-e2e-sentinel-v1";
@@ -56,8 +57,59 @@ fn run_until_shutdown(
     });
 }
 
+/// Echo handler for the downstream side: reflects back what the request
+/// carried, so credential-injection E2E tests can assert what the proxy
+/// added.
+///
+/// The response always starts with [`UPSTREAM_SENTINEL`] so existing
+/// sentinel-checking helpers ([`assert_upstream_reachable_on_host`] and
+/// the `contains(UPSTREAM_SENTINEL)` assertions) keep working. Then, for
+/// each of the three cred shapes we test, it appends a `FIELD: value`
+/// line only when that field is present:
+///
+/// - `QUERY: ...` — the request's query string.
+/// - `AUTHORIZATION: ...` — the `Authorization` header (auth injection).
+/// - `X-TEST-TOKEN: ...` — the `X-Test-Token` header (custom headers).
+///
+/// A request with none of these gets the sentinel alone, byte-for-byte
+/// the old response — so unifying the sentinel and echo servers is free.
+/// Uses `axum::http` re-exports (not the `http` crate directly) so we
+/// don't need `http` as a test-binary dependency.
+async fn echo_handler(
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> String {
+    let mut body = String::from(UPSTREAM_SENTINEL);
+    body.push('\n');
+
+    if let Some(query) = uri.query() {
+        body.push_str("QUERY: ");
+        body.push_str(query);
+        body.push('\n');
+    }
+
+    if let Some(v) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+    {
+        body.push_str("AUTHORIZATION: ");
+        body.push_str(v);
+        body.push('\n');
+    }
+
+    if let Some(v) = headers.get("x-test-token").and_then(|h| h.to_str().ok()) {
+        body.push_str("X-TEST-TOKEN: ");
+        body.push_str(v);
+        body.push('\n');
+    }
+
+    body
+}
+
 /// Spawn an axum test upstream on `127.0.1.1:0` that answers every
-/// request with [`UPSTREAM_SENTINEL`] and a `200 OK`, either plain HTTP
+/// request with the echo handler — [`UPSTREAM_SENTINEL`] first, then the
+/// query / `Authorization` / `X-Test-Token` reflected back when present
+/// (see [`echo_handler`]) — and a `200 OK`, either plain HTTP
 /// (`use_tls = false`) or TLS (`use_tls = true`).
 ///
 /// Returns the server handle plus the target URL. The handle is kept
@@ -98,8 +150,9 @@ fn spawn_axum_upstream(use_tls: bool) -> (Upstream, String) {
     // the chosen ephemeral port back so we can build the target URL.
     let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
 
-    // Answer every request with the sentinel body and a 200 OK.
-    let app = Router::new().route("/", get(|| async { UPSTREAM_SENTINEL }));
+    // Answer every request with the echo handler (sentinel + reflected
+    // credentials when present).
+    let app = Router::new().route("/", get(echo_handler));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
