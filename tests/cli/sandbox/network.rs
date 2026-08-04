@@ -5,8 +5,9 @@ use predicates::str::contains;
 use crate::utils::{
     cmd, cmd_with_config,
     http::{
-        UPSTREAM_SENTINEL, assert_upstream_reachable_on_host,
-        spawn_https_upstream, spawn_upstream,
+        UPSTREAM_SENTINEL, assert_https_upstream_reachable_on_host,
+        assert_upstream_reachable_on_host, spawn_https_upstream,
+        spawn_upstream,
     },
     tcp::{SENTINEL, read_sentinel_from_host, spawn_sentinel_listener},
 };
@@ -453,12 +454,13 @@ fn http_through_proxy_is_403_when_denied() {
 /// [`http_through_proxy_reaches_upstream_when_allowed`]: default
 /// `public_web` is `allow`, so the unknown `127.0.1.1` request is tunneled
 /// from the sandboxed client, through the proxy's CONNECT / raw-byte path,
-/// to the TLS upstream. `-k` skips verifying the throwaway self-signed
-/// cert.
+/// to the TLS upstream. The host-side control verifies the upstream's
+/// leaf against the CA1 test authority (no `-k`); the sandboxed client
+/// still uses `-k` until it trusts the CA1+CA2 bundle (prerequisite 3).
 #[test]
 fn https_through_proxy_reaches_upstream_when_allowed() {
     let (_server, target) = spawn_https_upstream();
-    assert_upstream_reachable_on_host(&target);
+    assert_https_upstream_reachable_on_host(&target);
 
     // TODO: the `-k` goes away once the sandbox has proper certs (CA1 +
     // CA2 bundle) so curl can verify against a real CA-issued upstream.
@@ -496,7 +498,7 @@ fn https_through_proxy_reaches_upstream_when_allowed() {
 #[test]
 fn https_through_proxy_is_403_when_denied() {
     let (_server, target) = spawn_https_upstream();
-    assert_upstream_reachable_on_host(&target);
+    assert_https_upstream_reachable_on_host(&target);
 
     let out = cmd()
         .args([

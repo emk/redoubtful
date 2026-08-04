@@ -1,6 +1,8 @@
 //! HTTP test server infrastructure.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf, sync::OnceLock};
+
+use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
 
 // All upstreams are axum servers (with an optional rustls acceptor) on
 // their own background tokio runtime. Mocking HTTP and HTTPS with one
@@ -55,6 +57,72 @@ fn run_until_shutdown(
             _ = shutdown => {}
         }
     });
+}
+
+/// The CA1 test authority — the hermetic "outside" CA that signs the
+/// test HTTPS upstream's leaf (see `docs/SSL_DESIGN.md`).
+///
+/// One is shared across the whole test process, generated on the fly
+/// (never committed to the tree, so no secret scanner is upset). It is
+/// the trust anchor the host-side controls verify the TLS upstream
+/// against, and is the CA1 the sandbox bundle will start from once MITM
+/// lands (prerequisite 4).
+struct Ca1 {
+    /// Issuer that signs the test upstream's leaf certs.
+    issuer: Issuer<'static, KeyPair>,
+    /// Path to the PEM-encoded CA1 certificate, so host-side `curl
+    /// --cacert` (and future `SSL_CERT_FILE` wiring) has a stable file.
+    cert_path: PathBuf,
+}
+
+/// Build or fetch the process-wide CA1 test authority.
+///
+/// `get_or_init` runs once per test process, lazily on the first TLS
+/// upstream or host control. The tempdir is leaked so the cert file
+/// stays valid for the process lifetime (same pattern as
+/// `shared_xdg_config_home`).
+fn ca1() -> &'static Ca1 {
+    static CA1: OnceLock<Ca1> = OnceLock::new();
+    CA1.get_or_init(|| {
+        let key_pair = KeyPair::generate().expect("generates CA1 keypair");
+
+        let mut params = CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "redoubtful test CA1");
+        params.distinguished_name = dn;
+
+        let ca_cert_pem = params
+            .self_signed(&key_pair)
+            .expect("CA1 self-signed cert")
+            .pem();
+
+        // Persist the CA cert PEM so host-side controls have a stable
+        // path to hand `curl --cacert`.
+        let dir = tempfile::tempdir().expect("tempdir for CA1 cert");
+        let dir_path = dir.keep();
+        let cert_path = dir_path.join("ca1.pem");
+        std::fs::write(&cert_path, ca_cert_pem).expect("write CA1 cert");
+
+        let issuer = Issuer::new(params, key_pair);
+        Ca1 { issuer, cert_path }
+    })
+}
+
+/// Sign a fresh leaf cert (with its key) for the `127.0.1.1` upstream
+/// using the shared CA1 test authority.
+fn sign_tls_leaf() -> (Vec<u8>, Vec<u8>) {
+    let leaf_key =
+        KeyPair::generate().expect("generates upstream leaf keypair");
+    let params = CertificateParams::new(vec!["127.0.1.1".to_string()])
+        .expect("leaf SANs for the 127.0.1.1 target");
+    let leaf = params
+        .signed_by(&leaf_key, &ca1().issuer)
+        .expect("CA1 signs the upstream leaf");
+    (
+        leaf.pem().into_bytes(),
+        leaf_key.serialize_pem().into_bytes(),
+    )
 }
 
 /// Echo handler for the downstream side: reflects back what the request
@@ -129,20 +197,12 @@ fn spawn_axum_upstream(use_tls: bool) -> (Upstream, String) {
     // "already installed" error from a parallel test.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // TLS upstreams need a throwaway self-signed leaf. `curl -k` skips
-    // verification, so nothing has to trust it; the IP SAN keeps it
-    // semantically right for the 127.0.1.1 target.
-    let cert = if use_tls {
-        let c =
-            rcgen::generate_simple_self_signed(vec!["127.0.1.1".to_string()])
-                .expect("rcgen creates a self-signed test cert");
-        Some((
-            c.cert.pem().into_bytes(),
-            c.signing_key.serialize_pem().into_bytes(),
-        ))
-    } else {
-        None
-    };
+    // TLS upstreams serve a fresh leaf signed by the shared CA1 test
+    // authority (see [`ca1`]); the IP SAN keeps it semantically right for
+    // the 127.0.1.1 target. The sandboxed client still uses `curl -k`
+    // until it trusts the CA1+CA2 bundle (prerequisite 3), while the
+    // host-side control verifies the leaf against CA1 with `--cacert`.
+    let cert = if use_tls { Some(sign_tls_leaf()) } else { None };
 
     // Bind inside the background runtime thread (NOT with a
     // `std::net::TcpListener` handed across threads — tokio rejects
@@ -240,8 +300,10 @@ pub fn spawn_upstream() -> (Upstream, String) {
 /// raw-byte tunnel**: the sandboxed client sends the proxy a
 /// `CONNECT 127.0.1.1:<port>` and the proxy pipes raw bytes to this TLS
 /// server (no MITM, no CA wiring — see `docs/SSL_DESIGN.md`). The cert
-/// is a throwaway rcgen self-signed leaf, so both the sandboxed client
-/// and the host-side control use `curl -k`.
+/// is a fresh leaf signed by the shared CA1 test authority (see [`ca1`]);
+/// the sandboxed client still uses `curl -k` until it trusts the CA1+CA2
+/// bundle (prerequisite 3), while the host-side control verifies the
+/// leaf against CA1 via [`assert_https_upstream_reachable_on_host`].
 pub fn spawn_https_upstream() -> (Upstream, String) {
     spawn_axum_upstream(true)
 }
@@ -253,13 +315,54 @@ pub fn spawn_https_upstream() -> (Upstream, String) {
 /// being misread as a routing pass or fail — the same two-stage pattern
 /// as the loopback-reachability tests.
 ///
-/// Uses `-k` so the same helper works for both the plain-HTTP upstream
-/// ([`spawn_upstream`], where it is a harmless no-op) and the TLS
-/// upstream ([`spawn_https_upstream`], whose throwaway self-signed
-/// cert must not be verified).
+/// For the plain-HTTP upstream ([`spawn_upstream`]); `-k` is a harmless
+/// no-op here (no TLS). The TLS upstream ([`spawn_https_upstream`]) is
+/// verified against CA1 by [`assert_https_upstream_reachable_on_host`]
+/// instead.
 pub fn assert_upstream_reachable_on_host(target: &str) {
     let out = std::process::Command::new("curl")
         .args(["-s", "-k", "--max-time", "10", "--noproxy", "*", target])
+        .output()
+        .expect("host control curl failed to run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(UPSTREAM_SENTINEL),
+        "positive control failed: host curl to {target} did not return the \
+         upstream sentinel; got {stdout:?}\n\
+         stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Host-side positive control for the TLS upstream: fetch `target`
+/// directly (bypassing any host-level proxy) and assert the sentinel
+/// arrives, **verifying the upstream's leaf against the CA1 test
+/// authority** (no `-k`).
+///
+/// This is the SSL-foundation prerequisite-2 proof: it asserts the
+/// upstream really serves a CA1-issued leaf and that the CA1 certificate
+/// is a valid trust anchor. It exists only because the sandboxed client
+/// still uses `curl -k` in passthrough (until prerequisite 3).
+///
+/// TODO (SSL foundation, next steps): this `--cacert` and the CA1
+/// plumbing behind it are test-side scaffolding for prerequisite 2. Once
+/// the sandbox trusts the CA1+CA2 bundle (prerequisite 4) and the
+/// passthrough tests drop `-k` (prerequisite 3), the sandboxed curl does
+/// this verification itself — remove the extra `--cacert` here (and any
+/// other temporary machinery we added in these steps) when that lands.
+pub fn assert_https_upstream_reachable_on_host(target: &str) {
+    let ca1_path = ca1().cert_path.to_str().expect("CA1 cert path is UTF-8");
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "--cacert",
+            ca1_path,
+            "--max-time",
+            "10",
+            "--noproxy",
+            "*",
+            target,
+        ])
         .output()
         .expect("host control curl failed to run");
     let stdout = String::from_utf8_lossy(&out.stdout);
