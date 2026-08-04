@@ -63,6 +63,7 @@ use crate::{
     },
     hostname::Hostname,
     prelude::*,
+    sandbox::ca_bundle,
 };
 
 /// Handle to the running proxy task.
@@ -71,30 +72,40 @@ use crate::{
 /// the caller invokes [`Self::shutdown`] to signal the proxy to
 /// stop accepting and to drain in-flight tunnels.
 ///
-/// Owns the per-session CA certificate as a [`NamedTempFile`] so it
-/// is cleaned up when the handle is dropped.
+/// Owns the per-session CA certificate and the merged sandbox CA
+/// bundle as [`NamedTempFile`]s so they are cleaned up when the
+/// handle is dropped.
 pub struct ProxyHandle {
     /// Host-loopback port the proxy is listening on. Pasta forwards
     /// this into the sandbox's netns; bwrap sets `HTTPS_PROXY` to
     /// `http://127.0.0.1:<port>`.
     pub port: u16,
-    /// Per-session CA certificate. Lives on disk so the launcher can
-    /// bind-mount it into the sandbox. Auto-deleted on drop.
+    /// Per-session CA certificate. Auto-deleted on drop.
     ca_cert: NamedTempFile,
+    /// Merged sandbox CA bundle (system + our CA). The launcher
+    /// bind-mounts this into the sandbox so sandboxed tools trust
+    /// the proxy's CA2. Auto-deleted on drop.
+    ca_bundle: NamedTempFile,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
 
 impl ProxyHandle {
-    /// Path to the CA certificate PEM file.
-    ///
-    /// The launcher bind-mounts this into the sandbox (e.g.
-    /// `/etc/ssl/certs/sandbox-ca.pem`) and sets CA-bundle env vars
-    /// (`SSL_CERT_FILE`, `GIT_SSL_CAINFO`, etc.) so sandboxed tools
-    /// trust it.
+    /// Path to the per-session CA certificate PEM file.
     #[expect(dead_code, reason = "consumed by launcher once MITM is wired")]
     pub fn ca_cert_path(&self) -> &Path {
         self.ca_cert.path()
+    }
+
+    /// Path to the merged sandbox CA bundle (system + our CA).
+    ///
+    /// The launcher bind-mounts this read-only into the sandbox at
+    /// [`crate::sandbox::ca_bundle::CA_BUNDLE_SANDBOX_PATH`] and sets
+    /// the CA env vars, so sandboxed tools verify the proxy's MITM
+    /// leaves against our CA while still trusting the real system
+    /// roots.
+    pub fn ca_bundle_path(&self) -> &Path {
+        self.ca_bundle.path()
     }
 
     /// Signal the proxy to stop and wait for its task to finish.
@@ -154,6 +165,21 @@ pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
         .map_err(|e| Error::other("could not write CA cert to temp file", e))?;
     debug!(ca_cert = ?ca_cert.path(), "CA cert persisted");
 
+    // Merged sandbox CA bundle: the system bundle (the same roots the
+    // upstream connector trusts, via openssl-probe) with our CA
+    // appended. The launcher bind-mounts this into the sandbox and sets
+    // the CA env vars, so sandboxed tools trust our CA2 while still
+    // verifying the real system roots. `find_system_ca_bundle` fails
+    // loudly if there is no system bundle at all — same guard the
+    // connector enforces below.
+    let system_ca = ca_bundle::find_system_ca_bundle()?;
+    let ca_bundle =
+        ca_bundle::write_sandbox_ca_bundle(&system_ca, ca_cert_pem.as_bytes())?;
+    debug!(
+        ca_bundle = ?ca_bundle.path(),
+        "merged sandbox CA bundle persisted"
+    );
+
     // Pure-Rust crypto for hudsucker's TLS layers. In tunnel-only
     // mode the provider isn't actually exercised on the proxy's
     // hot path (no MITM = no leaf cert signing, no inbound TLS
@@ -200,6 +226,7 @@ pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
     Ok(ProxyHandle {
         port,
         ca_cert,
+        ca_bundle,
         shutdown_tx: Some(shutdown_tx),
         task,
     })
@@ -450,19 +477,48 @@ pub fn proxy_env_vars(port: u16) -> EnvVars {
 /// Build a resolved [`Profile`] representing the proxy's contribution.
 ///
 /// This is a *resolved* (not declared) `Profile`: it contributes one
-/// same-port forward and 8 env vars, with no declarations to validate.
-/// Merged into the user's finalized profile via
-/// [`Finalize::merge_right_biased`] so proxy env vars win on any
-/// key collision.
+/// same-port forward, the proxy env vars, the merged CA bundle mount,
+/// and the CA env vars, with no declarations to validate. Merged into
+/// the user's finalized profile via [`Finalize::merge_right_biased`] so
+/// proxy env vars win on any key collision.
+///
+/// `ca_bundle_host_path` is the host-side merged CA bundle (from
+/// [`ProxyHandle::ca_bundle_path`]); it is bound read-only into the
+/// sandbox at [`crate::sandbox::ca_bundle::CA_BUNDLE_SANDBOX_PATH`], and
+/// the CA env vars point at that sandbox path so tools like curl/git/
+/// openssl trust the proxy's CA2 (plus the real system roots).
 ///
 /// See [`crate::config::Finalize`] for the `Finalize` trait.
-pub fn proxy_profile(port: u16) -> Profile {
+pub fn proxy_profile(port: u16, ca_bundle_host_path: &Path) -> Profile {
     let mut forwards = Forwards::default();
     forwards.forward(port, port);
+
+    let mut mounts = Mounts::default();
+    // `mount(sandbox, host, access)` — bind the host bundle file at the
+    // sandbox path, read-only.
+    mounts.mount(
+        ca_bundle::CA_BUNDLE_SANDBOX_PATH,
+        ca_bundle_host_path,
+        crate::config::mount::MountAccess::Ro,
+    );
+
+    let mut env = proxy_env_vars(port);
+    // CA env vars: replace-semantics vars all point at the merged
+    // sandbox bundle (system + our CA), so sandboxed tools verify the
+    // proxy's MITM leaves while still trusting the real system roots.
+    // `NODE_EXTRA_CA_CERTS` is append-semantics; pointing it at the
+    // same merged bundle is harmless (Node treats it as additional).
+    let bundle = ca_bundle::CA_BUNDLE_SANDBOX_PATH;
+    env.set("SSL_CERT_FILE", bundle);
+    env.set("CURL_CA_BUNDLE", bundle);
+    env.set("REQUESTS_CA_BUNDLE", bundle);
+    env.set("GIT_SSL_CAINFO", bundle);
+    env.set("NODE_EXTRA_CA_CERTS", bundle);
+
     Profile {
-        mounts: Mounts::default(),
+        mounts,
         forwards,
-        env: proxy_env_vars(port),
+        env,
         proxies: Proxies::default(),
     }
 }
@@ -522,6 +578,59 @@ mod tests {
                 &entry.value,
                 OsStr::new("localhost,127.0.0.1"),
                 "{name} value"
+            );
+        }
+    }
+
+    // ===== proxy_profile (CA bundle wiring) =====
+
+    #[test]
+    fn proxy_profile_mounts_ca_bundle_and_sets_ca_env_vars() {
+        let host_bundle = Path::new("/host/ca-bundle.crt");
+        let profile = proxy_profile(12345, host_bundle);
+
+        // The merged CA bundle is bound ro into the sandbox at the
+        // canonical sandbox path.
+        let ca_mount = profile
+            .mounts
+            .iter()
+            .find(|m| {
+                m.sandbox.as_path()
+                    == Path::new(
+                        crate::sandbox::ca_bundle::CA_BUNDLE_SANDBOX_PATH,
+                    )
+            })
+            .expect("CA bundle mount present");
+        match &ca_mount.kind {
+            crate::config::mount::MountKind::Mount { host, access } => {
+                assert_eq!(host, host_bundle, "binds the host bundle");
+                assert_eq!(
+                    *access,
+                    crate::config::mount::MountAccess::Ro,
+                    "CA bundle must be read-only"
+                );
+            }
+            other => panic!("CA bundle must be a Mount, got {other:?}"),
+        }
+
+        // All five CA env vars point at the sandbox bundle path.
+        let bundle = crate::sandbox::ca_bundle::CA_BUNDLE_SANDBOX_PATH;
+        for name in [
+            "SSL_CERT_FILE",
+            "CURL_CA_BUNDLE",
+            "REQUESTS_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+            "NODE_EXTRA_CA_CERTS",
+        ] {
+            let entry = profile
+                .env
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(
+                entry.value.to_str(),
+                Some(bundle),
+                "{name} should point at the sandbox bundle"
             );
         }
     }

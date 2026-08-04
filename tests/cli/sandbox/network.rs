@@ -6,7 +6,7 @@ use crate::utils::{
     cmd, cmd_with_config,
     http::{
         UPSTREAM_SENTINEL, assert_https_upstream_reachable_on_host,
-        assert_upstream_reachable_on_host, spawn_https_upstream,
+        assert_upstream_reachable_on_host, ca1_cert_path, spawn_https_upstream,
         spawn_upstream,
     },
     tcp::{SENTINEL, read_sentinel_from_host, spawn_sentinel_listener},
@@ -454,18 +454,21 @@ fn http_through_proxy_is_403_when_denied() {
 /// [`http_through_proxy_reaches_upstream_when_allowed`]: default
 /// `public_web` is `allow`, so the unknown `127.0.1.1` request is tunneled
 /// from the sandboxed client, through the proxy's CONNECT / raw-byte path,
-/// to the TLS upstream. The host-side control verifies the upstream's
-/// leaf against the CA1 test authority (no `-k`); the sandboxed client
-/// still uses `-k` until it trusts the CA1+CA2 bundle (prerequisite 3).
+/// to the TLS upstream.
+///
+/// This is the SSL-foundation prerequisite-3 proof: `SSL_CERT_FILE` on the
+/// `redoubtful` child points at CA1, so `find_system_ca_bundle` reads CA1
+/// as the "system" bundle and the merged sandbox CA bundle contains CA1.
+/// The sandboxed curl (no `-k`) verifies the CA1-issued upstream's leaf
+/// against CA1 in the bundle — real TLS verification end-to-end.
 #[test]
 fn https_through_proxy_reaches_upstream_when_allowed() {
     let (_server, target) = spawn_https_upstream();
     assert_https_upstream_reachable_on_host(&target);
 
-    // TODO: the `-k` goes away once the sandbox has proper certs (CA1 +
-    // CA2 bundle) so curl can verify against a real CA-issued upstream.
     let out = cmd()
-        .args(["run", "curl", "-sk", "--max-time", "10", &target])
+        .env("SSL_CERT_FILE", ca1_cert_path())
+        .args(["run", "curl", "-s", "--max-time", "10", &target])
         .output()
         .expect("run curl through proxy");
     assert!(out.status.success(), "run failed: {out:?}");
@@ -492,9 +495,9 @@ fn https_through_proxy_reaches_upstream_when_allowed() {
 /// decision rather than a dead listener (which the host-side control
 /// already rules out).
 ///
-/// TODO: the `-k` goes away once the sandbox has proper certs (CA1 +
-/// CA2 bundle), at which point this denies before any TLS handshake so
-/// it should still 403 regardless.
+/// No `-k` here: the deny short-circuits the CONNECT with 403 before any
+/// TLS handshake, so curl never verifies a certificate and doesn't need
+/// a trusted bundle.
 #[test]
 fn https_through_proxy_is_403_when_denied() {
     let (_server, target) = spawn_https_upstream();
@@ -505,7 +508,7 @@ fn https_through_proxy_is_403_when_denied() {
             "run",
             "--public-web=deny",
             "curl",
-            "-skv",
+            "-sv",
             "--max-time",
             "10",
             &target,

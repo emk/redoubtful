@@ -7,18 +7,29 @@
 > `docs/proxy-testing-challenges.md` — those refer here instead of
 > repeating the details.
 >
-> **Status — prerequisite 1 (single source of CA truth) is IMPLEMENTED.**
-> `src/sandbox/proxy.rs` now builds the upstream-client connector with
-> `with_http_connector(...)` from a `rustls-native-certs` / `openssl-probe`
-> root store (off the compiled-in Mozilla roots); see
-> [`build_upstream_connector`](../src/sandbox/proxy.rs). Still *not*
-> implemented: the sandbox-leg CA bundle (CA2 appended to the merged
-> bundle), the CA1 test upstream, and dropping `-k` in passthrough tests.
-> Per the revised phasing in `plans/PROXY_CONFIG.md` ("SSL foundation
-> phasing"), this was the first prerequisite to build, before any HTTPS/MITM
-> work or dropping `-k` in passthrough tests. This doc uses **CA1** (the
-> outside test/server CA) and **CA2** (redoubtful's internal MITM CA)
-> terminology — see the phasing doc for the who-verifies-which table.
+> **Status — SSL foundation prerequisites 1–3 are IMPLEMENTED.**
+>
+> - **Prerequisite 1 (single source of CA truth):** `src/sandbox/proxy.rs`
+>   builds the upstream-client connector with `with_http_connector(...)`
+>   from a `rustls-native-certs` / `openssl-probe` root store (off the
+>   compiled-in Mozilla roots); see [`build_upstream_connector`](../src/sandbox/proxy.rs).
+> - **Prerequisite 2 (an actual CA1):** `tests/cli/utils/http.rs` serves
+>   the test HTTPS upstream with a leaf signed by a dedicated on-the-fly
+>   `rcgen` CA1, and the host-side control verifies it with `curl --cacert`.
+> - **Prerequisite 3 (sandbox CA bundle + drop `-k`):** `src/sandbox/ca_bundle.rs`
+>   builds the merged CA1+CA2 bundle (system via `openssl-probe` + our CA),
+>   `ProxyHandle::ca_bundle_path()` exposes it, `proxy_profile` bind-mounts
+>   it ro into the sandbox and sets the `*_CA_*` env vars. The HTTPS
+>   passthrough tests dropped `-k` and now verify the CA1-issued upstream
+>   end-to-end.
+>
+> Still *not* implemented: prerequisite 4 (MITM — flipping `should_intercept`
+> per-host for `allowed && has_injection_config`, injecting on the decrypted
+> inner request, and the HTTPS injection E2E). Per the phasing in
+> `plans/PROXY_CONFIG.md` ("SSL foundation phasing"), prerequisites 1–3 were
+> built first, before any MITM work. This doc uses **CA1** (the outside
+> test/server CA) and **CA2** (redoubtful's internal MITM CA) terminology —
+> see the phasing doc for the who-verifies-which table.
 
 This document is about how different parts of redoubtful's stack decide
 which TLS certificates to trust, and why we want them to agree.
@@ -167,11 +178,13 @@ a self-hosted sandbox endpoint speaks.
      raw. This is safe precisely because the injection-relevant streams
      (SSE) are HTTP, not WebSocket.
    The cheap insurance is the first; the simpler policy is the second.
-4. **No CA trust wiring for passthrough routing tests.** In tunnel mode
-   the proxy never terminates TLS, so neither the upstream-client store
-   nor the sandbox bundle is engaged. Passthrough tests need `curl -k`
-   and zero CA machinery; the upstream-client seam is only exercised once
-   MITM comes (Stage 4).
+4. **CA trust wiring for passthrough routing tests.** In tunnel mode
+   the proxy never terminates TLS, so the sandbox bundle is not strictly
+   needed — but since the merged CA1+CA2 bundle (prerequisite 3) landed,
+   the passthrough tests set `SSL_CERT_FILE` to CA1 on the `redoubtful`
+   child and drop `-k`, verifying the CA1-issued upstream end-to-end. The
+   upstream-client seam is only exercised once MITM comes (Stage 4,
+   prerequisite 4).
 
 ## Testing implications
 
@@ -245,13 +258,12 @@ Rationale vs `tiny_http`: `tiny_http`'s `ssl-rustls` pulls in an
  tokio-rustls stack and moves in sync with it. The async-vs-sync hosting
 cost is absorbed by the shared background-`Runtime` upstream.
 
-**For clean MITM upgrade (this is CA1):** the test upstream should be
-**CA1-issued** by a dedicated `rcgen` test CA (not a bare self-signed
-leaf; today `spawn_https_upstream` still uses
-`rcgen::generate_simple_self_signed`, so a CA1 does **not** exist yet),
-and the CA1 PEM kept as a test artifact. In test mode, point
-`SSL_CERT_FILE` / `openssl-probe` at CA1 so it masquerades as "the
-system store"; then:
+**CA1 (implemented, prerequisite 2):** the test upstream is
+**CA1-issued** by a dedicated on-the-fly `rcgen` test CA (never
+committed), and the CA1 PEM is kept as a test artifact
+(`tests/cli/utils/http.rs`, `ca1()` + `ca1_cert_path()`). In test mode,
+`SSL_CERT_FILE` / `openssl-probe` points at CA1 so it masquerades as
+"the system store"; then:
 
 - **sandbox leg** trusts the merged **CA1 + CA2** bundle (CA2 = the
   proxy's per-session MITM CA, appended on top), so curl can verify the
@@ -259,8 +271,9 @@ system store"; then:
 - **upstream-client leg** trusts **CA1** so redoubtful's own client can
   MITM-connect to the test upstream (it does not need CA2).
 
-Passthrough tests can still use `curl -k` until the sandbox bundle
-(CA1 + CA2) is wired — the tunnel tests carry a `// TODO` waiting on it.
+Passthrough tests set `SSL_CERT_FILE` to CA1 on the `redoubtful` child
+so the sandbox bundle (CA1 + CA2) contains CA1 — this is how they dropped
+`-k` (prerequisite 3).
 
 ## Other details worth remembering
 

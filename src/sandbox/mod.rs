@@ -20,6 +20,7 @@
 
 pub mod argv;
 pub mod bwrap;
+pub mod ca_bundle;
 pub mod pasta;
 pub mod proxy;
 pub mod rewrite;

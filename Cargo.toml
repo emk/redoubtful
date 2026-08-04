@@ -28,6 +28,7 @@ libc = "0.2.186"
 rustls-native-certs = "0.8.4"
 
 miette = { version = "7.6.0", features = ["fancy"] }
+openssl-probe = "0.2.1"
 rcgen = "0.14.7"
 # `ring` feature so the proxy can install a pure-Rust crypto provider
 # at runtime via `rustls::crypto::ring::default_provider()`. Note:

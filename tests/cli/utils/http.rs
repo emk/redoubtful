@@ -109,6 +109,17 @@ fn ca1() -> &'static Ca1 {
     })
 }
 
+/// Path to the PEM-encoded CA1 test certificate.
+///
+/// The SSL-foundation E2E tests set `SSL_CERT_FILE` on the `redoubtful`
+/// child to this path, so `find_system_ca_bundle` reads CA1 as the
+/// "system" bundle and the merged sandbox bundle contains CA1 (which is
+/// what lets sandboxed curl verify the CA1-issued test upstream without
+/// `-k`).
+pub fn ca1_cert_path() -> &'static std::path::Path {
+    ca1().cert_path.as_path()
+}
+
 /// Sign a fresh leaf cert (with its key) for the `127.0.1.1` upstream
 /// using the shared CA1 test authority.
 fn sign_tls_leaf() -> (Vec<u8>, Vec<u8>) {
@@ -339,17 +350,11 @@ pub fn assert_upstream_reachable_on_host(target: &str) {
 /// arrives, **verifying the upstream's leaf against the CA1 test
 /// authority** (no `-k`).
 ///
-/// This is the SSL-foundation prerequisite-2 proof: it asserts the
+/// This is the positive control for the TLS upstream: it asserts the
 /// upstream really serves a CA1-issued leaf and that the CA1 certificate
-/// is a valid trust anchor. It exists only because the sandboxed client
-/// still uses `curl -k` in passthrough (until prerequisite 3).
-///
-/// TODO (SSL foundation, next steps): this `--cacert` and the CA1
-/// plumbing behind it are test-side scaffolding for prerequisite 2. Once
-/// the sandbox trusts the CA1+CA2 bundle (prerequisite 4) and the
-/// passthrough tests drop `-k` (prerequisite 3), the sandboxed curl does
-/// this verification itself — remove the extra `--cacert` here (and any
-/// other temporary machinery we added in these steps) when that lands.
+/// is a valid trust anchor. The host curl verifies against CA1 with
+/// `--cacert` because the host itself doesn't trust the test CA1 (only
+/// the sandbox does, via the merged CA bundle).
 pub fn assert_https_upstream_reachable_on_host(target: &str) {
     let ca1_path = ca1().cert_path.to_str().expect("CA1 cert path is UTF-8");
     let out = std::process::Command::new("curl")

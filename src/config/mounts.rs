@@ -203,7 +203,11 @@ impl Mounts {
     }
 
     /// Append a bind mount with the given [`MountAccess`].
-    fn mount(
+    ///
+    /// `pub(crate)` so the proxy can bind the merged CA bundle into the
+    /// sandbox (`proxy_profile` in `sandbox/proxy.rs`); everything else
+    /// constructs mounts via [`Finalize::base_config`] or tests.
+    pub(crate) fn mount(
         &mut self,
         sandbox: impl Into<PathBuf>,
         host: impl Into<PathBuf>,

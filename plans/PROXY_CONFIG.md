@@ -1,6 +1,6 @@
 # Proxy Configuration Sketch
 
-> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete. Stage 4 (credential injection) **partially implemented** — Phase 4.1 (HTTP-forward injection, no MITM) is done and green; Phase 4.2 (HTTPS MITM + CA trust) is planned. Stage 5 (E2E testing): the HTTP routing harness is implemented (pulled ahead of Stage 4, per `docs/proxy-testing-challenges.md`); HTTP-forward injection E2E is green; HTTPS injection E2E is still planned. SSL foundation: prerequisite 1 (single source of CA truth) is **done**; prerequisites 2 (CA1 test upstream) and 3 (drop `-k`) remain.
+> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete. Stage 4 (credential injection) **partially implemented** — Phase 4.1 (HTTP-forward injection, no MITM) is done and green; Phase 4.2 (HTTPS MITM + CA trust) is planned. Stage 5 (E2E testing): the HTTP routing harness is implemented (pulled ahead of Stage 4, per `docs/proxy-testing-challenges.md`); HTTP-forward injection E2E is green; HTTPS injection E2E is still planned. SSL foundation: prerequisite 1 (single source of CA truth) is **done**; prerequisite 2 (CA1 test upstream) is **done**; prerequisite 3 (sandbox CA1+CA2 bundle + drop `-k`) is **done**; prerequisite 4 (MITM) remains.
 >
 > **Revised phasing after review.** Work on the SSL/CA foundation *before* further HTTPS-side work. See "SSL foundation phasing" below for the updated order and the CA1+CA2 model.
 
@@ -266,7 +266,13 @@ Today redoubtful has two *separate* trust stores that should be one:
 **that is unimplemented** (the doc's status is "Reference design notes").
 This is the first prerequisite to build.
 
-### Revised phasing order
+### Revised phasing order (two commits)
+
+Prerequisites 1 and 2 are done. Prerequisites 3 and 4 share one piece of
+machinery — the merged sandbox CA bundle (system/CA1 as "system" +
+per-session CA2) bind-mounted ro into the sandbox with the CA env vars
+set — so they land as **two commits that share that foundation**, each
+independently green:
 
 1. **Single source of CA truth.** Make the proxy's upstream-client leg
    trust the same roots the sandbox sees, via `with_http_connector`
@@ -276,16 +282,28 @@ This is the first prerequisite to build.
    built in `src/sandbox/proxy.rs` (`build_upstream_connector`).
 2. **An actual CA1.** Convert the test upstream from a bare self-signed
    leaf to a CA-issued leaf (dedicated `rcgen` test CA, PEM kept as a
-   test artifact), and point the test environment's `openssl-probe` /
-   `SSL_CERT_FILE` at CA1.
-3. **Drop `-k` in the existing passthrough tests.** Only meaningful once
-   the sandbox has proper certs (the CA1+CA2 bundle), so curl can verify
-   against a real CA1-issued upstream. The tunnel tests carry a `// TODO`
-   currently waiting on this.
-4. **MITM** (`should_intercept` per-host: `allowed && has_injection_config`),+
-   inject on the decrypted inner request, wire the per-session CA2 into
-   the sandbox (bind-mount the merged CA1+CA2 bundle + set the CA env
-   vars). *Then* the HTTPS injection tests go green.
+   test artifact). The host-side positive control verifies the leaf
+   against CA1 with `curl --cacert`. **DONE** — `tests/cli/utils/http.rs`
+   (the `ca1()` + `sign_tls_leaf()` machinery).
+3. **Sandbox CA bundle + drop `-k` (commit 1).** Build the merged
+   CA1+CA2 bundle (`ca_bundle.rs`: `find_system_ca_bundle` via
+   `openssl-probe`, `build_sandbox_ca_bundle`), persist it as a
+   host-side `NamedTempFile` owned by `ProxyHandle`, bind-mount it ro
+   into the sandbox at `/tmp/redoubtful-ca-bundle.crt`, and set the CA
+   env vars (`SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`,
+   `GIT_SSL_CAINFO`, `NODE_EXTRA_CA_CERTS`). *No `should_intercept`
+   change.* Drop `-k` in the HTTPS passthrough tests — the sandboxed
+   curl now verifies the CA1-issued upstream against CA1 in the bundle.
+   This is a natural green checkpoint: it hermetic-validates the entire
+   CA1 sandbox-leg end-to-end with no MITM risk. (Note: the passthrough
+   tests set `SSL_CERT_FILE` on the `redoubtful` child to CA1 so
+   `find_system_ca_bundle` reads CA1 as the "system" bundle.) **DONE.**
+4. **MITM (commit 2).** `should_intercept` per-host:
+   `allowed && has_injection_config` (`Proxies::should_mitm`), inject on
+   the decrypted inner request, set `SSL_CERT_FILE` on the redoubtful
+   process so the upstream-client leg trusts CA1. The CA2 bundle wiring
+   from commit 1 is reused as-is. *Then* the HTTPS injection E2E tests
+   go green.
 
 ### Known config bugs fixed while wiring the red test
 
