@@ -33,7 +33,7 @@ pub struct Rewrite {
 impl Rewrite {
     /// Build from a `Proxy` if it carries anything to inject, else `None`.
     pub fn from_proxy(p: &crate::config::proxy::Proxy) -> Option<Self> {
-        if p.headers.is_empty() && p.params.is_empty() && p.auth.is_none() {
+        if !p.has_injection() {
             return None;
         }
         Some(Self {

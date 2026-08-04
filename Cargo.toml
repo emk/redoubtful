@@ -56,6 +56,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 xdg = "3.0.0"
 url = "2.5.8"
 base64 = "0.23.0"
+lru = "0.18.2"
+http = "1"
 
 [dev-dependencies]
 assert_cmd = "2.2.1"

@@ -66,7 +66,6 @@ pub enum ProxyAuthDecl {
 /// `Debug` on this enum delegates to the `Secret` variants which
 /// redact their values. Consumed by the proxy server at runtime
 /// (Stage 3) for credential injection.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ProxyAuth {
     /// Basic authentication with username and password.
@@ -245,7 +244,6 @@ fn resolve_auth(
 ///
 /// Consumed by the proxy server at runtime for destination routing and
 /// credential injection.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Proxy {
     /// The hostname or IP address.
@@ -260,6 +258,19 @@ pub struct Proxy {
     pub params: BTreeMap<String, Secret>,
     /// Resolved authentication credentials.
     pub auth: Option<ProxyAuth>,
+}
+
+impl Proxy {
+    /// Whether this destination carries any credential-injection config.
+    ///
+    /// This is the MITM gate: only hosts with something to inject need
+    /// the proxy to terminate TLS and rewrite the inner request. A host
+    /// with no headers/params/auth is tunneled raw end-to-end.
+    pub fn has_injection(&self) -> bool {
+        !self.headers.is_empty()
+            || !self.params.is_empty()
+            || self.auth.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -540,5 +551,48 @@ mod tests {
             "JSON must not leak secret value: {json}",
         );
         assert_eq!(json, "\"***\"");
+    }
+
+    // ===== has_injection (the MITM gate) =====
+
+    fn blank_proxy() -> Proxy {
+        Proxy {
+            host: host("example.net"),
+            port: 443,
+            action: ProxyAction::Allow,
+            headers: BTreeMap::new(),
+            params: BTreeMap::new(),
+            auth: None,
+        }
+    }
+
+    #[test]
+    fn has_injection_false_when_blank() {
+        assert!(!blank_proxy().has_injection());
+    }
+
+    #[test]
+    fn has_injection_true_with_header() {
+        let mut p = blank_proxy();
+        p.headers.insert("X-Api-Key".into(), Secret("k".into()));
+        assert!(p.has_injection());
+    }
+
+    #[test]
+    fn has_injection_true_with_param() {
+        let mut p = blank_proxy();
+        p.params.insert("api_key".into(), Secret("k".into()));
+        assert!(p.has_injection());
+    }
+
+    #[test]
+    fn has_injection_true_with_auth() {
+        let p = Proxy {
+            auth: Some(ProxyAuth::Bearer {
+                token: Secret("tok".into()),
+            }),
+            ..blank_proxy()
+        };
+        assert!(p.has_injection());
     }
 }

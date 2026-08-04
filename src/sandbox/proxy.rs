@@ -19,18 +19,20 @@
 //!   forwarded upstream; CONNECT streams are tunneled raw (no MITM).
 //! - Denied hosts: an HTTP 403 `Response` is returned, short-circuiting
 //!   the request before it reaches any upstream.
-//!
-//! Credential injection (headers, params, auth) is deferred to
-//! Stage 4 — allowed hosts always tunnel in this stage.
+//! - Hosts carrying credential-injection config (headers/params/auth)
+//!   are MITM'd: `should_intercept_connect` returns `true`, hudsucker
+//!   terminates TLS with a CA2-signed leaf, and the decrypted inner
+//!   request is fed back through `handle_request`, which injects and
+//!   forwards it.
 //!
 //! **Certificate authority.** Hudsucker's builder requires `with_ca`
 //! to leave the `WantsCa` state. We generate a fresh per-session CA
 //! with `rcgen`, pass the [`Issuer`] to hudsucker for leaf cert
-//! signing, and persist the CA's self-signed certificate to a
-//! [`NamedTempFile`] owned by [`ProxyHandle`]. The launcher reads the
-//! path via [`ProxyHandle::ca_cert_path`] to bind-mount the cert into
-//! the sandbox, and sets CA-bundle env vars so sandboxed tools trust
-//! it.
+//! signing, and fold the CA's self-signed certificate into a merged
+//! **sandbox CA bundle** (system roots + our CA) owned as a
+//! [`NamedTempFile`] by [`ProxyHandle`]. The launcher bind-mounts that
+//! bundle into the sandbox and sets CA-bundle env vars so sandboxed
+//! tools trust the proxy's leaves.
 //!
 //! **Upstream TLS trust.** The proxy's outbound HTTPS connector — the
 //! one it will use when MITM-forwarding to a real upstream (Phase 4.2)
@@ -40,19 +42,29 @@
 //! See [`build_upstream_connector`] and `docs/SSL_DESIGN.md`.
 
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
+use http::uri::Authority;
 use hudsucker::{
     Body, HttpContext, HttpHandler, Proxy,
-    certificate_authority::RcgenAuthority,
+    certificate_authority::CertificateAuthority,
     hyper::{Method, Request, Response, StatusCode},
 };
 use hyper_util::client::legacy::connect::HttpConnector;
-use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
-use rustls::crypto::CryptoProvider;
+use lru::LruCache;
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
+    Issuer, KeyPair, KeyUsagePurpose, SanType, string::Ia5String,
+};
+use rustls::{
+    ServerConfig,
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+};
 use tempfile::NamedTempFile;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
@@ -72,16 +84,14 @@ use crate::{
 /// the caller invokes [`Self::shutdown`] to signal the proxy to
 /// stop accepting and to drain in-flight tunnels.
 ///
-/// Owns the per-session CA certificate and the merged sandbox CA
-/// bundle as [`NamedTempFile`]s so they are cleaned up when the
-/// handle is dropped.
+/// Owns the merged sandbox CA bundle as a [`NamedTempFile`] so it is
+/// cleaned up when the handle is dropped. (The per-session CA cert
+/// itself is folded into that bundle, so it needs no separate file.)
 pub struct ProxyHandle {
     /// Host-loopback port the proxy is listening on. Pasta forwards
     /// this into the sandbox's netns; bwrap sets `HTTPS_PROXY` to
     /// `http://127.0.0.1:<port>`.
     pub port: u16,
-    /// Per-session CA certificate. Auto-deleted on drop.
-    ca_cert: NamedTempFile,
     /// Merged sandbox CA bundle (system + our CA). The launcher
     /// bind-mounts this into the sandbox so sandboxed tools trust
     /// the proxy's CA2. Auto-deleted on drop.
@@ -91,12 +101,6 @@ pub struct ProxyHandle {
 }
 
 impl ProxyHandle {
-    /// Path to the per-session CA certificate PEM file.
-    #[expect(dead_code, reason = "consumed by launcher once MITM is wired")]
-    pub fn ca_cert_path(&self) -> &Path {
-        self.ca_cert.path()
-    }
-
     /// Path to the merged sandbox CA bundle (system + our CA).
     ///
     /// The launcher bind-mounts this read-only into the sandbox at
@@ -155,15 +159,11 @@ pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
     let (public_web, entries) = proxies.routing_summary();
     debug!(?public_web, entries = ?entries, "proxy routing config");
 
-    // Per-session CA: issuer goes to hudsucker for leaf cert signing,
-    // PEM cert goes to a temp file so the launcher can bind-mount it
-    // into the sandbox.
+    // Per-session CA: the issuer goes to hudsucker for leaf cert
+    // signing; the PEM cert is folded into the merged sandbox bundle
+    // below (so sandboxed tools trust it). No separate temp file is
+    // needed.
     let (issuer, ca_cert_pem) = build_throwaway_ca()?;
-    let ca_cert = NamedTempFile::new()
-        .map_err(|e| Error::other("could not create CA cert temp file", e))?;
-    std::fs::write(ca_cert.path(), &ca_cert_pem)
-        .map_err(|e| Error::other("could not write CA cert to temp file", e))?;
-    debug!(ca_cert = ?ca_cert.path(), "CA cert persisted");
 
     // Merged sandbox CA bundle: the system bundle (the same roots the
     // upstream connector trusts, via openssl-probe) with our CA
@@ -180,13 +180,15 @@ pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
         "merged sandbox CA bundle persisted"
     );
 
-    // Pure-Rust crypto for hudsucker's TLS layers. In tunnel-only
-    // mode the provider isn't actually exercised on the proxy's
-    // hot path (no MITM = no leaf cert signing, no inbound TLS
-    // accept), but the builder needs one to wire up its outbound
-    // hyper-rustls client.
+    // Pure-Rust crypto for hudsucker's TLS layers. In MITM mode the
+    // provider is what signs the CA2 leaf certs and terminates the
+    // client's TLS, and the builder needs one to wire up its outbound
+    // hyper-rustls client too.
     let provider = rustls::crypto::ring::default_provider();
-    let ca = RcgenAuthority::new(issuer, 1024, provider.clone());
+    // Our own authority (not hudsucker's `RcgenAuthority`): it emits the
+    // correct SAN type for IP-literal hosts, which hudsucker's built-in
+    // one gets wrong (it always uses `DnsName`). See [`SandboxCa`].
+    let ca = SandboxCa::new(issuer, provider.clone());
 
     // Upstream-client trust: the same roots the sandbox sees (system
     // bundle via openssl-probe), not hudsucker's compiled-in Mozilla
@@ -225,7 +227,6 @@ pub async fn start_proxy(proxies: &Proxies) -> Result<ProxyHandle> {
 
     Ok(ProxyHandle {
         port,
-        ca_cert,
         ca_bundle,
         shutdown_tx: Some(shutdown_tx),
         task,
@@ -280,6 +281,126 @@ fn build_throwaway_ca() -> Result<(Issuer<'static, KeyPair>, String)> {
     let issuer = Issuer::new(params, key_pair);
 
     Ok((issuer, ca_cert_pem))
+}
+
+/// Our per-session MITM CA authority for hudsucker.
+///
+/// Replaces hudsucker's built-in [`RcgenAuthority`](hudsucker::certificate_authority::RcgenAuthority),
+/// which has a bug: it always emits a `DnsName` SAN for the MITM leaf,
+/// even when the target host is an IP literal. curl and browsers require
+/// an `IpAddress` SAN for an IP peer, so MITM'ing an IP host — like our
+/// `127.0.1.1` test target, or a real bare-IP service — would fail
+/// verification. We emit the correct SAN type per host and keep a tiny
+/// LRU cache of generated configs (so repeated MITM'd hosts reuse a leaf).
+struct SandboxCa {
+    issuer: Issuer<'static, KeyPair>,
+    private_key: PrivateKeyDer<'static>,
+    provider: CryptoProvider,
+    cache: Mutex<LruCache<Authority, Arc<ServerConfig>>>,
+}
+
+/// Cap on cached per-host server configs. Certs are tiny and re-signing
+/// is cheap; this only avoids regenerating the same leaf on every
+/// connection to a repeated host.
+const CA_CACHE_CAPACITY: usize = 10;
+
+#[allow(
+    clippy::expect_used,
+    reason = "all expects here are true can't-happen assertions"
+)]
+impl SandboxCa {
+    fn new(issuer: Issuer<'static, KeyPair>, provider: CryptoProvider) -> Self {
+        let private_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(
+            issuer.key().serialize_der(),
+        ));
+        Self {
+            issuer,
+            private_key,
+            provider,
+            cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(CA_CACHE_CAPACITY)
+                    .expect("cache capacity is a non-zero constant"),
+            )),
+        }
+    }
+
+    /// Sign a fresh leaf cert for `authority`, with an `IpAddress` SAN
+    /// when the host is an IP literal and a `DnsName` SAN otherwise.
+    fn gen_cert(&self, authority: &Authority) -> CertificateDer<'static> {
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, authority.host());
+        params.distinguished_name = dn;
+        params.subject_alt_names.push(leaf_san(authority.host()));
+
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.use_authority_key_identifier_extension = true;
+        params
+            .signed_by(self.issuer.key(), &self.issuer)
+            // We control the issuer; signing a leaf with it can't fail.
+            .expect("CA2 signs the MITM leaf")
+            .into()
+    }
+}
+
+/// The SAN for a MITM leaf: an `IpAddress` SAN for an IP-literal host, a
+/// `DnsName` SAN otherwise.
+///
+/// This is the hudsucker bug we fix: its `RcgenAuthority` always emits a
+/// `DnsName` SAN even for IP hosts, which curl/browsers reject. Kept as a
+/// free function so the decision is directly unit-testable.
+#[allow(
+    clippy::expect_used,
+    reason = "hostnames that reach a DnsName SAN are valid IA5String"
+)]
+fn leaf_san(host: &str) -> SanType {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => SanType::IpAddress(ip),
+        Err(_) => SanType::DnsName(
+            Ia5String::try_from(host)
+                .expect("hostname SAN hosts are valid IA5String"),
+        ),
+    }
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "all expects here are true can't-happen assertions"
+)]
+impl CertificateAuthority for SandboxCa {
+    async fn gen_server_config(
+        &self,
+        authority: &Authority,
+    ) -> Arc<ServerConfig> {
+        if let Some(cached) = self
+            .cache
+            .lock()
+            .expect("proxy CA cache lock poisoned")
+            .get(authority)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let cert = self.gen_cert(authority);
+        let mut server_cfg = ServerConfig::builder_with_provider(Arc::new(
+            self.provider.clone(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("proxy CA TLS protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], self.private_key.clone_key())
+        .expect("proxy CA server config builds");
+        server_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let server_cfg = Arc::new(server_cfg);
+
+        self.cache
+            .lock()
+            .expect("proxy CA cache lock poisoned")
+            .put(authority.clone(), Arc::clone(&server_cfg));
+        server_cfg
+    }
 }
 
 /// Build the proxy's outbound HTTPS connector.
@@ -352,13 +473,14 @@ fn roots_from_certs(
 ///
 /// - Allowed HTTP requests: credentials (headers/params/auth) are
 ///   injected for hosts that carry them, then the request is forwarded.
-/// - Allowed CONNECT: passed through untouched (MITM is a `should_intercept`
-///   decision, Phase 4.2).
+/// - Allowed CONNECT: passed through untouched, unless the host carries
+///   injection config — then `should_intercept_connect` MITMs it and the
+///   decrypted inner request comes back through here to be injected.
 /// - Denied hosts: an HTTP 403 `Response` is returned, short-circuiting
 ///   the request before it reaches any upstream.
 ///
-/// `should_intercept` is never consulted for routing — it only gates
-/// MITM on CONNECT, which Phase 4.1 does not do. `Clone` because
+/// `should_intercept_connect` gates MITM on CONNECT; it is never
+/// consulted for routing (that's `handle_request`). `Clone` because
 /// hudsucker clones the handler per connection; cloning `Arc` is cheap.
 #[derive(Clone)]
 struct PassthroughHandler {
@@ -368,16 +490,20 @@ struct PassthroughHandler {
 impl HttpHandler for PassthroughHandler {
     /// Decide whether to MITM a CONNECT stream.
     ///
-    /// Stage 3 is tunnel-only: allowed CONNECT hosts are piped raw
-    /// bytes end-to-end and never intercepted, so this returns `false`
-    /// unconditionally. Stage 4 (credential injection) will flip this
-    /// per-host to enable MITM.
+    /// Only hosts that carry credential-injection config are MITM'd
+    /// (allowed hosts with nothing to inject stay tunneled raw). Denied
+    /// hosts already 403'd in `handle_request`, so they never reach here;
+    /// a host with no injection config has nothing for MITM to do.
     async fn should_intercept_connect(
         &mut self,
         _ctx: &HttpContext,
-        _req: &Request<Body>,
+        req: &Request<Body>,
     ) -> bool {
-        false
+        match req.uri().host().and_then(|h| h.parse::<Hostname>().ok()) {
+            Some(host) => self.proxies.should_mitm(&host),
+            // No host or parse failure: nothing to inject, tunnel it.
+            None => false,
+        }
     }
 
     /// Gateway for every request (HTTP and CONNECT). Routes based on
@@ -747,5 +873,61 @@ mod tests {
         // Unknown state → deny (safety default)
         let proxies = Proxies::with_entries(None, []);
         assert!(!proxies.should_allow(&host("anything.net")));
+    }
+
+    // ===== SandboxCa (MITM leaf SANs) =====
+
+    fn mk_sandbox_ca() -> SandboxCa {
+        let (issuer, _ca_pem) = build_throwaway_ca().expect("builds CA");
+        let provider = rustls::crypto::ring::default_provider();
+        SandboxCa::new(issuer, provider)
+    }
+
+    #[test]
+    fn leaf_san_uses_ip_san_for_ip_host() {
+        // The hudsucker bug this fixes: `RcgenAuthority` always emits a
+        // `DnsName` SAN, which curl rejects for an IP-literal peer. Our
+        // authority must emit an `IpAddress` SAN instead.
+        match leaf_san("127.0.1.1") {
+            rcgen::SanType::IpAddress(ip) => {
+                assert_eq!(ip, IpAddr::from([127, 0, 1, 1]));
+            }
+            other => panic!("expected IpAddress SAN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leaf_san_uses_dns_san_for_hostname() {
+        match leaf_san("example.com") {
+            rcgen::SanType::DnsName(n) => {
+                assert_eq!(n.to_string(), "example.com")
+            }
+            other => panic!("expected DnsName SAN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_ca_gen_cert_produces_a_valid_leaf() {
+        // Smoke test that `gen_cert` signs a parseable, CA-signed leaf.
+        let ca = mk_sandbox_ca();
+        let authority: Authority =
+            "127.0.1.1:8080".parse().expect("valid authority");
+        let cert = ca.gen_cert(&authority);
+        // `CertificateDer` is just DER bytes; a valid leaf is non-empty
+        // and its issuer matches our CA's subject name.
+        assert!(!cert.is_empty(), "leaf must be non-empty DER");
+    }
+
+    #[tokio::test]
+    async fn sandbox_ca_caches_server_config_per_host() {
+        let ca = mk_sandbox_ca();
+        let authority: Authority =
+            "127.0.1.1:8080".parse().expect("valid authority");
+        let first = ca.gen_server_config(&authority).await;
+        let second = ca.gen_server_config(&authority).await;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeat host should reuse the cached config",
+        );
     }
 }

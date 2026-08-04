@@ -414,6 +414,100 @@ auth = {{ token = "injected-bearer-token" }}
     );
 }
 
+/// HTTPS analog of
+/// [`credential_injection_injects_headers_params_and_auth`]: this time the
+/// request is **MITM'd** — the proxy terminates TLS with a CA2-signed leaf,
+/// injects the configured headers/params/auth on the decrypted inner
+/// request, then reconnects to the upstream over TLS and forwards.
+///
+/// This is the SSL-foundation prerequisite-4 proof, and it exercises both
+/// CA legs at once:
+///
+/// - **Sandbox leg**: `SSL_CERT_FILE` on the `redoubtful` child points at
+///   CA1, so the merged sandbox bundle is CA1 + CA2. The sandboxed curl
+///   (no `-k`) verifies the proxy's CA2-signed leaf against CA2 in that
+///   bundle.
+/// - **Upstream-client leg**: the proxy's outbound connector (via
+///   `openssl-probe`) also sees CA1, so it can MITM-reconnect to the
+///   CA1-issued test upstream and verify it.
+///
+/// The echo upstream reflects the injected values back, so the assertions
+/// below prove injection happened on the decrypted inner request.
+#[test]
+fn https_credential_injection_mitms_and_injects() {
+    let (_server, target) = spawn_https_upstream();
+    assert_https_upstream_reachable_on_host(&target);
+
+    let port: u16 = url::Url::parse(&target)
+        .expect("target is a URL")
+        .port()
+        .expect("target URL contains a port");
+
+    let toml = format!(
+        r#"[profile.inject-test]
+[[profile.inject-test.proxies]]
+host = "127.0.1.1"
+port = {port}
+action = "allow"
+headers = {{ "X-Test-Token" = "test-token-value" }}
+params = {{ "api_key" = "injected-key" }}
+auth = {{ token = "injected-bearer-token" }}
+"#
+    );
+
+    let out = cmd_with_config(&toml)
+        .env("SSL_CERT_FILE", ca1_cert_path())
+        .args([
+            "run",
+            "-u",
+            "inject-test",
+            "curl",
+            "-s",
+            "--max-time",
+            "10",
+            &target,
+        ])
+        .output()
+        .expect("run curl with HTTPS injection config");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        out.status.success(),
+        "run failed: {out:?}\nstdout: {stdout}\nstderr: {stderr}",
+    );
+    assert!(
+        stdout.contains(UPSTREAM_SENTINEL),
+        "sandboxed curl did not reach the echo upstream through the MITM'd \
+         HTTPS proxy; expected the upstream sentinel.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+
+    // URL query param injection on the decrypted inner request.
+    assert!(
+        stdout.contains("QUERY: api_key=injected-key"),
+        "expected the injected query param reflected back by the echo \
+         upstream. This asserts `params` injection on the MITM'd inner \
+         request.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+
+    // Bearer auth injection -> `Authorization` header.
+    assert!(
+        stdout.contains("AUTHORIZATION: Bearer injected-bearer-token"),
+        "expected the injected bearer token reflected back by the echo \
+         upstream. This asserts `auth` (Bearer) injection on the MITM'd \
+         inner request.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+
+    // Custom header injection.
+    assert!(
+        stdout.contains("X-TEST-TOKEN: test-token-value"),
+        "expected the injected custom header reflected back by the echo \
+         upstream. This asserts `headers` injection on the MITM'd inner \
+         request.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
 /// `--public-web=deny` denies any host not explicitly allowed, so the
 /// unknown `127.0.1.1` request is short-circuited by the proxy's 403
 /// before it ever reaches the upstream. The host-side control proves the

@@ -178,6 +178,19 @@ impl Proxies {
         }
     }
 
+    /// Whether to MITM a CONNECT to `host`: allowed *and* carries
+    /// credential-injection config.
+    ///
+    /// Denied hosts never reach here (the 403 short-circuits in
+    /// `handle_request` first), and unknown hosts have nothing to inject,
+    /// so the gate is simply `allowed && has_injection_config`.
+    pub fn should_mitm(&self, host: &Hostname) -> bool {
+        matches!(
+            self.get(host),
+            Some(p) if p.action == ProxyAction::Allow && p.has_injection()
+        )
+    }
+
     /// Whether a proxy server process is needed at all.
     ///
     /// Returns `true` when any outbound traffic would pass through
@@ -558,5 +571,62 @@ mod tests {
             },
         );
         assert!(!proxies.is_proxy_server_needed().unwrap());
+    }
+
+    // ===== should_mitm (the MITM gate) =====
+
+    /// A proxy entry with the given action, optionally carrying a bearer
+    /// auth so `has_injection()` is true.
+    fn mk_proxy(action: ProxyAction, with_injection: bool) -> Proxy {
+        Proxy {
+            host: host("example.net"),
+            port: 443,
+            action,
+            headers: BTreeMap::new(),
+            params: BTreeMap::new(),
+            auth: if with_injection {
+                Some(crate::config::proxy::ProxyAuth::Bearer {
+                    token: crate::config::Secret("tok".into()),
+                })
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn should_mitm_allowed_with_injection() {
+        let proxies = Proxies::with_entries(
+            Some(ProxyAction::Allow),
+            [mk_proxy(ProxyAction::Allow, true)],
+        );
+        assert!(proxies.should_mitm(&host("example.net")));
+    }
+
+    #[test]
+    fn should_mitm_allowed_no_injection() {
+        let proxies = Proxies::with_entries(
+            Some(ProxyAction::Allow),
+            [mk_proxy(ProxyAction::Allow, false)],
+        );
+        assert!(!proxies.should_mitm(&host("example.net")));
+    }
+
+    #[test]
+    fn should_mitm_denied_with_injection() {
+        // A denied host never reaches `should_intercept_connect` (the 403
+        // short-circuits in `handle_request` first), but the gate should
+        // still be false for it.
+        let proxies = Proxies::with_entries(
+            Some(ProxyAction::Allow),
+            [mk_proxy(ProxyAction::Deny, true)],
+        );
+        assert!(!proxies.should_mitm(&host("example.net")));
+    }
+
+    #[test]
+    fn should_mitm_unknown_host() {
+        let proxies = Proxies::with_entries(Some(ProxyAction::Allow), []);
+        assert!(!proxies.should_mitm(&host("unknown.net")));
     }
 }

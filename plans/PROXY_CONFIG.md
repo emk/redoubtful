@@ -1,6 +1,6 @@
 # Proxy Configuration Sketch
 
-> **Status:** Human-written spec with Qwen3-written detailed plans. Supercedes `docs/ARCHITECTURE.md` and `docs/SECURITY_PHILOSOPHY.md`. Stage 1 complete; Stage 2 complete; Stage 3 complete. Stage 4 (credential injection) **partially implemented** — Phase 4.1 (HTTP-forward injection, no MITM) is done and green; Phase 4.2 (HTTPS MITM + CA trust) is planned. Stage 5 (E2E testing): the HTTP routing harness is implemented (pulled ahead of Stage 4, per `docs/proxy-testing-challenges.md`); HTTP-forward injection E2E is green; HTTPS injection E2E is still planned. SSL foundation: prerequisite 1 (single source of CA truth) is **done**; prerequisite 2 (CA1 test upstream) is **done**; prerequisite 3 (sandbox CA1+CA2 bundle + drop `-k`) is **done**; prerequisite 4 (MITM) remains.
+> **Status:** **DONE.** All stages are complete and green. Stages 1–3 (config types, allow/deny routing) are done; Stage 4 (credential injection) is done — Phase 4.1 (HTTP-forward injection, no MITM) and Phase 4.2 (HTTPS MITM + CA trust) both green; Stage 5 (E2E testing) is done — HTTP routing, HTTP-forward injection, and HTTPS injection E2E all green. SSL foundation prerequisites 1–4 (single source of CA truth, CA1 test upstream, sandbox CA bundle + drop `-k`, MITM) are all done. This plan is a historical record of the work; see `docs/SSL_DESIGN.md` for the current SSL trust design.
 >
 > **Revised phasing after review.** Work on the SSL/CA foundation *before* further HTTPS-side work. See "SSL foundation phasing" below for the updated order and the CA1+CA2 model.
 
@@ -298,12 +298,21 @@ independently green:
    CA1 sandbox-leg end-to-end with no MITM risk. (Note: the passthrough
    tests set `SSL_CERT_FILE` on the `redoubtful` child to CA1 so
    `find_system_ca_bundle` reads CA1 as the "system" bundle.) **DONE.**
-4. **MITM (commit 2).** `should_intercept` per-host:
+4. **MITM (commit 2).** `should_intercept_connect` per-host:
    `allowed && has_injection_config` (`Proxies::should_mitm`), inject on
-   the decrypted inner request, set `SSL_CERT_FILE` on the redoubtful
-   process so the upstream-client leg trusts CA1. The CA2 bundle wiring
-   from commit 1 is reused as-is. *Then* the HTTPS injection E2E tests
-   go green.
+   the decrypted inner request (already wired in `handle_request`'s
+   allowed path — hudsucker feeds the inner request back through it),
+   set `SSL_CERT_FILE` on the redoubtful process so the upstream-client
+   leg trusts CA1. The CA2 bundle wiring from commit 1 is reused as-is.
+   **DONE** — the HTTPS injection E2E test (`https_credential_injection_mitms_and_injects`)
+   is green.
+
+> **Hudsucker bug worked around:** the MITM leaves are signed by our own
+> `SandboxCa` authority (not hudsucker's `RcgenAuthority`), because
+> `RcgenAuthority` always emits a `DnsName` SAN even for IP-literal hosts —
+> which curl/browsers reject (they require an `IpAddress` SAN). Without
+> the workaround, MITM'ing an IP target like `127.0.1.1` fails verification.
+> Worth reporting upstream. See `docs/SSL_DESIGN.md`.
 
 ### Known config bugs fixed while wiring the red test
 
