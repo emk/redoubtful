@@ -44,7 +44,16 @@ deny = [
     { name = "openssl-sys" },
 ]
 skip = [
-    # `miette` pulls in both 0.1.x (directly) and 0.2.x (via `textwrap`).
-    # Nothing we can do about it at our level.
+    # `miette` pulls in both 0.1.x (directly) and 0.2.x (via `console`/`textwrap`).
     { name = "unicode-width" },
+    # Upstream lag: `pem`/`rcgen` (via hudsucker) use 0.22; we use 0.23 directly.
+    { name = "base64" },
+    # `capctl` is stuck on bitflags 1.x; the rest of the graph uses 2.x.
+    { name = "bitflags" },
+    # `ring` pins getrandom 0.2; `rand`/`uuid` have moved to 0.4.
+    { name = "getrandom" },
+    # Ecosystem migration to syn 3.0 still in progress (syn 2 under asn1-rs/darling/etc.).
+    { name = "syn" },
+    # `tokio-tungstenite` uses 0.26; `hyper-rustls` uses 1.0.
+    { name = "webpki-roots" },
 ]

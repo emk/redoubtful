@@ -345,7 +345,7 @@ impl HttpHandler for PassthroughHandler {
     /// bytes end-to-end and never intercepted, so this returns `false`
     /// unconditionally. Stage 4 (credential injection) will flip this
     /// per-host to enable MITM.
-    async fn should_intercept(
+    async fn should_intercept_connect(
         &mut self,
         _ctx: &HttpContext,
         _req: &Request<Body>,
